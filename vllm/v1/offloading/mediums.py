@@ -35,3 +35,16 @@ class CPULoadStoreSpec(BlockIDLoadStoreSpec):
     @staticmethod
     def medium() -> str:
         return "CPU"
+
+class SharedStorageLoadStoreSpec(LoadStoreSpec):
+    """
+    Spec for loading/storing a KV block to Shared storage.
+    """
+
+
+    def __init__(self, block_hash: int):
+        self.block_hash = block_hash
+
+    @staticmethod
+    def medium() -> str:
+        return "SHARED_STORAGE"
