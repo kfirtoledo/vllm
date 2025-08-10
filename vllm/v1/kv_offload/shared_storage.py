@@ -71,12 +71,14 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
                 tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
                 tp_rank=self.vllm_config.parallel_config.rank,
                 src_tensors=gpu_caches,
+                src_block_size=self.offloaded_block_size,
                 dtype=self.vllm_config.cache_config.cache_dtype,
                 root_dir=self.extra_config.get("shared_kv_root", "/mnt/shared-kv")
             )
 
             self._shared_to_gpu_func = generate_get_transfer_function(
                 dst_tensors=gpu_caches,
+                dst_block_size=self.offloaded_block_size,
                 model_name=self.vllm_config.model_config.model,
                 tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
                 tp_rank=self.vllm_config.parallel_config.rank,
