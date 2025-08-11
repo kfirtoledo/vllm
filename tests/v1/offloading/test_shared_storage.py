@@ -16,6 +16,8 @@ from vllm.v1.offloading.worker.shared_storage import (
 
 from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
 
+TMP_DIR = "/tmp/shared-kv-test"
+
 # ----------------------------
 # Helpers functions
 # ----------------------------
@@ -79,41 +81,51 @@ def log_file_info(base_path, block_hashes):
     num_files = len(file_sizes)
     return num_files, file_sizes
 
-def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str, num_layers: int, num_blocks: int, block_size: int, num_heads: int, head_size: int, block_ids: list[int], group_size: int):
+def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str, num_layers: int, num_blocks: int,
+                   block_size: int, num_heads: int, head_size: int, read_block_ids: list[int], write_block_ids: list[int], group_size: int,max_concurrency:int):
     """Perform a PUT and GET roundtrip for the specified configuration and validate results."""
 
     original = create_dummy_kv_tensors(num_layers, num_blocks, block_size, num_heads, head_size, dtype)
     restored = [torch.zeros_like(t) for t in original]
-    gpu_specs = make_gpu_specs(block_ids)
-    num_files = math.ceil(len(block_ids) / group_size)
-    storage_specs, block_hashes = make_storage_specs(num_files)
+
+
+    put_gpu_specs = make_gpu_specs(write_block_ids)
+    put_num_files = math.ceil(len(write_block_ids) / group_size)
+    put_storage_specs, block_hashes = make_storage_specs(put_num_files)
     base_path = cleanup_files(model_name, tp_size, tp_rank, dtype, root_dir, block_hashes)
 
     # PUT phase: write KV blocks to shared storage
-    put_fn = generate_put_transfer_function(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, src_tensors=original, src_block_size=group_size, dtype=dtype, root_dir=root_dir)
+    put_fn = generate_put_transfer_function(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, src_tensors=original, gpu_blocks_per_file=group_size, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency)
     start_put = time.time()
-    ok_put = put_fn((gpu_specs, storage_specs))
+    ok_put = put_fn((put_gpu_specs, put_storage_specs))
     dur_put = time.time() - start_put
     assert ok_put, "PUT failed"
     for h in block_hashes:
         assert os.path.exists(get_file_name(base_path, h)), "missing file after PUT"
 
     # GET phase: load KV blocks back from shared storage
-    get_fn = generate_get_transfer_function(dst_tensors=restored, dst_block_size=group_size, model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir)
+    get_fn = generate_get_transfer_function(dst_tensors=restored, gpu_blocks_per_file=group_size, model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency)
     start_get = time.time()
-    ok_get = get_fn((storage_specs, gpu_specs))
+    # Create GPU specs and storage specs for the read operation
+    read_gpu_specs = make_gpu_specs(read_block_ids)
+    get_num_files = math.ceil(len(read_block_ids) / group_size)
+    start_index = len(put_storage_specs) - get_num_files
+    get_storage_specs = put_storage_specs[start_index:]
+
+    ok_get = get_fn((get_storage_specs, read_gpu_specs))
     dur_get = time.time() - start_get
     assert ok_get, "GET failed"
-    assert_blocks_equal(original, restored, block_ids)
+    assert_blocks_equal(original, restored, read_block_ids)
 
     # Print results
-    total_mb = total_block_size_mb(num_layers, num_heads, block_size, head_size, dtype, len(block_ids))
+    write_total_mb = total_block_size_mb(num_layers, num_heads, block_size, head_size, dtype, len(write_block_ids))
+    read_total_mb = total_block_size_mb(num_layers, num_heads, block_size, head_size, dtype, len(read_block_ids))
     file_size_mb = os.path.getsize(get_file_name(base_path, block_hashes[0])) / (1024 * 1024)
     num_files = len(block_hashes)
     print(
-        f"[INFO] group={group_size} "
-        f"PUT {dur_put:.4f}s ({throughput_gbps(total_mb, dur_put):.2f} GB/s), "
-        f"GET {dur_get:.4f}s ({throughput_gbps(total_mb, dur_get):.2f} GB/s), "
+        f"[INFO] group={group_size} write blocks len: {len(write_block_ids)} read blocks len: {len(read_block_ids)} "
+        f"PUT {dur_put:.4f}s ({throughput_gbps(write_total_mb, dur_put):.2f} GB/s), "
+        f"GET {dur_get:.4f}s ({throughput_gbps(read_total_mb, dur_get):.2f} GB/s), "
         f"files={num_files}, sizes(MB)={file_size_mb:.2f} "
     )
 # ----------------------------
@@ -121,17 +133,22 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
 # ----------------------------
 
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
-def test_shared_storage_roundtrip_param(group_size: int, tmp_path):
+@pytest.mark.parametrize("start_idx", [0, 3])  # 0 = full from start, 3 = partial first group (e.g., 3..7)
+def test_shared_storage_roundtrip_param(group_size: int, start_idx: int):
     """Test roundtrip save/load for multiple group sizes using model-like dimensions."""
     model_name = "llama3-70b"
     tp_size = 2
     tp_rank = 0
     dtype = torch.float16
-    root_dir = str(tmp_path)
+    root_dir = TMP_DIR
     num_layers = 80
     block_size = 16
     num_heads = 64
     head_size = 128
     num_blocks = 8
-    block_ids = list(range(num_blocks))
-    roundtrip_once(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir, num_layers=num_layers, num_blocks=num_blocks, block_size=block_size, num_heads=num_heads, head_size=head_size, block_ids=block_ids, group_size=group_size)
+    write_block_ids = list(range(num_blocks))
+    read_block_ids = list(range(start_idx, num_blocks))
+    max_concurrency = 8
+    roundtrip_once(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir, num_layers=num_layers,
+                   num_blocks=num_blocks, block_size=block_size, num_heads=num_heads, head_size=head_size, read_block_ids=read_block_ids,
+                   write_block_ids=write_block_ids, group_size=group_size,max_concurrency=max_concurrency)
