@@ -1,6 +1,7 @@
 import aiofiles
 import asyncio
 import numpy as np
+import math
 import torch
 import os
 from typing import List, Optional
@@ -10,7 +11,6 @@ from vllm.v1.offloading.worker.worker import TransferFunction, TransferSpec
 from vllm.logger import init_logger
 
 HASH_NAME_INDEX = -1  # Use the last spec's hash ID for the file name
-MAX_CONCURRENCY = 100  # Default max concurrency for file operations
 logger = init_logger(__name__)
 
 
@@ -52,12 +52,22 @@ def get_file_name(base_path: Path, block_hash: int) -> Path:
         Full path to a file like base/aaaaaaaa/bbbbbbbb/aaaaaaaa bbbbbbbb.bin
         Two-level sharding keeps directories small.
     """
-    block_hash_hex = f"{block_hash:x}"
+    block_hash_hex = f"{block_hash & ((1 << 64) - 1):016x}" #  force unsigned 64-bit, always 16 hex digits
     subfolder1 = block_hash_hex[:8]
     subfolder2 = block_hash_hex[8:16]
     full_path = base_path / subfolder1 / subfolder2 / f"{block_hash_hex}.bin"
     os.makedirs(full_path.parent, exist_ok=True)
     return full_path
+
+
+
+def get_block_offset(dst_tensors: list[torch.Tensor]) -> int:
+    """Get the byte offset for a given block tensor."""
+    block_size_bytes = 0
+    for tensor in dst_tensors:
+        block = tensor[:, 0]  # Use block 0 to get the shape
+        block_size_bytes += block.numel() * block.element_size()
+    return block_size_bytes
 
 
 # -----------------------
@@ -88,6 +98,11 @@ def convert_tensors_to_bytes(
     # Flatten across layers and K/V
     flat = torch.cat(blocks, dim=0)
     flat = flat.contiguous().detach().cpu()
+
+    # Special handling for bfloat16 → uint16 storage
+    if flat.dtype == torch.bfloat16:
+        flat = flat.view(torch.uint16)
+
     return memoryview(flat.numpy())
 
 
@@ -113,17 +128,23 @@ def write_buffer_to_file(target_file: Path, buffer: memoryview) -> None:
 def convert_bytes_to_tensors(
     buffer: bytes,
     dst_tensors: List[torch.Tensor],
+    gpu_blocks_per_file: int,
     block_ids_list: List[int],
+    block_offset: int
 ) -> None:
     """Restore bytes into the given destination tensors by block id."""
+
     mv = memoryview(buffer)  # zero-copy view over the whole file
     offset = 0
+    assert len(block_ids_list) <= gpu_blocks_per_file # length should be smaller
+    if len(block_ids_list) % gpu_blocks_per_file != 0:
+        offset = block_offset *(gpu_blocks_per_file - len(block_ids_list)) # If not full blocks, start at the offset
 
     for block_id in block_ids_list:
         for tensor in dst_tensors:
+
             block = tensor[:, block_id]
             num_bytes = block.numel() * block.element_size()
-
             # slice the memoryview without copying
             mv_block = mv[offset:offset + num_bytes]
             offset += num_bytes
@@ -144,6 +165,7 @@ def convert_bytes_to_tensors(
                 src = src.to(device=block.device, dtype=block.dtype, non_blocking=True)
 
             block.copy_(src)
+
 
 def torch_dtype_to_numpy(dtype) -> np.dtype:
     mapping = {
@@ -218,7 +240,7 @@ async def _to_bytes_async(src_tensors: List[torch.Tensor], block_ids: List[int])
 
 
 async def _from_bytes_async(
-    buffer: bytes, dst_tensors: List[torch.Tensor], block_ids: List[int]
+    buffer: bytes, dst_tensors: List[torch.Tensor], gpu_blocks_per_file: int, block_ids: List[int], block_offset: int
 ) -> None:
     """Deserialize bytes into destination tensors off the event loop.
 
@@ -229,7 +251,7 @@ async def _from_bytes_async(
     """
     loop = asyncio.get_running_loop()  # Get the currently running asyncio event loop for this task
     return await loop.run_in_executor( # Schedule a blocking CPU-bound function to run in a background thread
-        None, lambda: convert_bytes_to_tensors(buffer, dst_tensors, block_ids)
+        None, lambda: convert_bytes_to_tensors(buffer, dst_tensors, gpu_blocks_per_file, block_ids, block_offset )
     )
 
 
@@ -262,11 +284,10 @@ def generate_put_transfer_function(
     tp_size: int,
     tp_rank: int,
     src_tensors: List[torch.Tensor],
-    src_block_size: int,  # number of GPU blocks per file
-    dtype: torch.dtype = torch.float16,
-    root_dir: str = "/mnt/shared-kv",
-    *,
-    max_concurrency: int = MAX_CONCURRENCY,
+    gpu_blocks_per_file: int,  # number of GPU blocks per file
+    dtype: torch.dtype,
+    root_dir: str,
+    max_concurrency: int,
 ) -> TransferFunction:
     """Create a TransferFunction that writes blocks to shared storage.
 
@@ -275,7 +296,7 @@ def generate_put_transfer_function(
         tp_size: Tensor parallel world size.
         tp_rank: Current tensor parallel rank.
         src_tensors: Per-layer KV tensors to pull blocks from.
-        src_block_size: Number of source blocks to group into one file.
+        gpu_blocks_per_file: Number of source blocks to group into one file.
         dtype: Data type used to choose the directory.
         root_dir: Root folder for shared storage.
         max_concurrency: Max concurrent file tasks.
@@ -331,10 +352,10 @@ def generate_put_transfer_function(
         sem = asyncio.Semaphore(max_concurrency)
         tasks = []
 
-        # Pack src_block_size source specs into each destination spec.
+        # Pack gpu_blocks_per_file source specs into each destination spec.
         for i, dst_spec in enumerate(dst_specs):
-            start = i * src_block_size
-            end = min((i + 1) * src_block_size, len(src_specs))
+            start = i * gpu_blocks_per_file
+            end = min((i + 1) * gpu_blocks_per_file, len(src_specs))
             if start >= len(src_specs):
                 break
             block_ids = [src_specs[j].block_id for j in range(start, end)]
@@ -371,20 +392,19 @@ def generate_put_transfer_function(
 
 def generate_get_transfer_function(
     dst_tensors: List[torch.Tensor],
-    dst_block_size: int,  # number of destination blocks per file
+    gpu_blocks_per_file: int,  # number of destination blocks per file
     model_name: str,
     tp_size: int,
     tp_rank: int,
-    dtype: torch.dtype = torch.float16,
-    root_dir: str = "/mnt/shared-kv",
-    *,
-    max_concurrency: int = MAX_CONCURRENCY,
+    dtype: torch.dtype,
+    root_dir: str,
+    max_concurrency: int,
 ) -> TransferFunction:
     """Create a TransferFunction that reads blocks from shared storage.
 
     Args:
         dst_tensors: Per-layer KV tensors to write restored blocks into.
-        dst_block_size: Number of destination blocks each file provides.
+        gpu_blocks_per_file: Number of destination blocks each file provides.
         model_name: Model identifier for path namespacing.
         tp_size: Tensor parallel world size.
         tp_rank: Current tensor parallel rank.
@@ -403,6 +423,7 @@ def generate_get_transfer_function(
         root_dir=root_dir,
     )
 
+    block_offset = get_block_offset(dst_tensors)
     async def _read_group(src_spec, block_ids: List[int], sem: asyncio.Semaphore) -> bool:
         """Read one grouped file and fill the destination blocks.
 
@@ -422,7 +443,7 @@ def generate_get_transfer_function(
                 return False
 
             try:
-                await _from_bytes_async(buf, dst_tensors, block_ids)
+                await _from_bytes_async(buf, dst_tensors, gpu_blocks_per_file, block_ids, block_offset)
                 return True
             except Exception as e:
                 logger.warning("GET convert failed for %s: %r", path, e)
@@ -438,14 +459,21 @@ def generate_get_transfer_function(
         sem = asyncio.Semaphore(max_concurrency)
         tasks = []
 
-        # Each src_spec file restores dst_block_size destination blocks.
+        # The first group may be partial, so calculate its length
+        first_len = len(dst_specs) % gpu_blocks_per_file or gpu_blocks_per_file
+        start = 0
+
+        # Each src_spec file restores gpu_blocks_per_file destination blocks.
         for i, src_spec in enumerate(src_specs):
-            start = i * dst_block_size
-            end = min((i + 1) * dst_block_size, len(dst_specs))
             if start >= len(dst_specs):
                 break
+
+            size = first_len if i == 0 else gpu_blocks_per_file
+            end = min(start + size, len(dst_specs))
             block_ids = [dst_specs[j].block_id for j in range(start, end)]
             tasks.append(_read_group(src_spec, block_ids, sem))
+
+            start += size
 
         if not tasks:
             return True
@@ -463,6 +491,8 @@ def generate_get_transfer_function(
             True if all grouped reads and conversions succeeded.
         """
         src_specs, dst_specs = spec
+        assert len(src_specs) == math.ceil(len(dst_specs) / gpu_blocks_per_file), \
+            f"Mismatch sizes of source spec {len(src_specs)} and destination specs {len(dst_specs)}, gpu_blocks_per_file {gpu_blocks_per_file}"
         try:
             return _run_async_in_thread(_main_get(src_specs, dst_specs))
         except Exception as e:

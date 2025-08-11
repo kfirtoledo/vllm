@@ -39,7 +39,6 @@ class SharedStorageOffloadingManager(OffloadingManager):
         for block_hash in block_hashes:
 
             file_path = get_file_name(self.base_path, block_hash)
-            logger.info(f"[Storage_offloading]Looking up block hash {block_hash} at {file_path}")
             if not os.path.exists(file_path):
                 break
             hit_count += 1
