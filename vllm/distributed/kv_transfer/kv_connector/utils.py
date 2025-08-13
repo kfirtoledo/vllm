@@ -143,6 +143,8 @@ class KVOutputAggregator:
         finished_recving = set[str]()
         for output in outputs:
             output = output.kv_connector_output
+            if not output:
+                continue
             update_finished_set(output.finished_sending,
                                 self._send_remaining_count, finished_sending)
             update_finished_set(output.finished_recving,
