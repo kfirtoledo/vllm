@@ -655,6 +655,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
   cache_ops.impl("swap_blocks", torch::kCUDA, &swap_blocks);
 
+  // Swap in (out) the cache blocks from src to dst. Multi-layer operation.
+  cache_ops.def(
+      "swap_blocks_multi_layer(Tensor[] src_kv_caches, "
+      "Tensor[] dst_kv_caches, Tensor block_mapping) -> ()");
+  cache_ops.impl("swap_blocks_multi_layer",
+                 torch::kCUDA, &swap_blocks_multi_layer);
+
   // Copy the cache blocks from src to dst.
   cache_ops.def(
       "copy_blocks(Tensor(a!)[] key_caches, Tensor[](b!) value_caches, "

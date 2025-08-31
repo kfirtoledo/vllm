@@ -101,6 +101,14 @@ class FlashAttentionBackend(AttentionBackend):
         ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst)
 
     @staticmethod
+    def swap_blocks_multi_layer(
+        src_kv_caches: list[torch.Tensor],
+        dst_kv_caches: list[torch.Tensor],
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        ops.swap_blocks_multi_layer(src_kv_caches, dst_kv_caches, src_to_dst)
+
+    @staticmethod
     def get_kv_cache_stride_order() -> tuple[int, ...]:
         # `stride_order` indicates the permutation that gets
         # us from `get_kv_cache_shape` to the actual memory layout we want.
