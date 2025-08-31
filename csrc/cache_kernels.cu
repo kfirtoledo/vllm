@@ -96,6 +96,7 @@ void swap_blocks_multi_layer(
   const int64_t num_blocks = block_mapping.size(0);
   const at::cuda::OptionalCUDAGuard device_guard(
       src_device.is_cuda() ? src_device : dst_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // Loop over layers
   for (size_t layer = 0; layer < src_kv_caches.size(); ++layer) {
@@ -127,13 +128,17 @@ void swap_blocks_multi_layer(
         int64_t src_offset = src_block_number * block_size_in_bytes;
         int64_t dst_offset = dst_block_number * block_size_in_bytes;
 
-        cudaMemcpy(dst_ptr + dst_offset,
-                   src_ptr + src_offset,
-                   block_size_in_bytes,
-                   memcpy_type);
+        cudaMemcpyAsync(dst_ptr + dst_offset,
+                        src_ptr + src_offset,
+                        block_size_in_bytes,
+                        memcpy_type,
+                        stream);
       }
     }
   }
+
+  // Synchronize once after all copies queued
+  cudaStreamSynchronize(stream);
 }
 
 namespace vllm {
