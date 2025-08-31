@@ -115,6 +115,8 @@ def generate_tensors_transfer_function(
     src_block_size_factor = src_block_size // min_block_size
     dst_block_size_factor = dst_block_size // min_block_size
 
+    cuda_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
     def transfer_function(spec: TransferSpec) -> bool:
         src_blocks_specs_list, dst_blocks_specs_list = spec
 
@@ -134,9 +136,15 @@ def generate_tensors_transfer_function(
                                   device="cpu",
                                   dtype=torch.int64).view(-1, 2)
 
-        # iterate over layers
-        for src_tensor, dst_tensor in zip(src_tensors, dst_tensors):
-            attn_backend.swap_blocks(src_tensor, dst_tensor, src_to_dst)
+        if torch.cuda.is_available():
+            # Use CUDA stream
+            with torch.cuda.stream(cuda_stream):
+                attn_backend.swap_blocks_multi_layer(
+                    src_tensors, dst_tensors, src_to_dst)
+        else:
+            # Run directly without stream
+            attn_backend.swap_blocks_multi_layer(
+                src_tensors, dst_tensors, src_to_dst)
 
         # always successful
         return True
