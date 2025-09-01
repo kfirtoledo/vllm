@@ -156,11 +156,12 @@ def write_buffer_to_file(target_file: Path, buffer: memoryview) -> None:
         os.fsync(f.fileno())    # Force the OS to flush its write cache to disk for durability
     os.replace(tmp_file_path, target_file)
 
-
-def read_file_to_bytes(path: Path) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
+import mmap
+def read_file_to_bytes(path: Path):
+    f = open(path, "rb")
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    # return both so caller can mm.close(); f.close() after conversion
+    return mm, f
 
 # -----------------------------
 # Flexible PUT (thread pool)
@@ -271,10 +272,10 @@ def generate_get_transfer_function(
         path = get_file_name(base_path, block_hash)
 
         try:
-            #start_put = time.time()
-            buf = read_file_to_bytes(path)
-            #end_put = time.time()- start_put
-            #print(f"Time taken to read file {path}: {end_put} seconds")
+            start_put = time.time()
+            buf, f = read_file_to_bytes(path)
+            end_put = time.time()- start_put
+            print(f"Time taken to read file {path}: {end_put} seconds")
         except Exception as e:
             logger.warning("GET read failed for %s: %r", path, e)
             return False
@@ -288,6 +289,9 @@ def generate_get_transfer_function(
         except Exception as e:
             logger.warning("GET convert failed for %s: %r", path, e)
             return False
+        finally:
+            buf.close()
+            f.close()
 
     def transfer_function(spec: TransferSpec) -> bool:
         """Entry point used by the worker to perform GET."""
