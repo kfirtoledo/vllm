@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import queue
 import threading
-from typing import Callable
 import time
+from typing import Callable
+import torch
 from vllm.logger import init_logger
 from vllm.v1.offloading.abstract import LoadStoreSpec
 
@@ -47,11 +48,14 @@ class OffloadingWorker:
         self.num_threads = num_threads
         self._shutdown_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
+        self.streams = [torch.cuda.Stream() for _ in range(num_threads)]
 
         for thread_idx in range(num_threads):
             t = threading.Thread(target=self.run,
                                  args=(thread_idx, ),
-                                 name=f"{transfer_type}-worker-{thread_idx}")
+                                 name=f"{transfer_type}-worker-{thread_idx}",
+                                 daemon=True  # dies with parent
+                                 )
             t.start()
             self._worker_threads.append(t)
 
@@ -59,42 +63,32 @@ class OffloadingWorker:
                     num_threads, transfer_type)
 
     def run(self, thread_idx: int):
-        while True:
-            job_id, transfer_spec = self.submission_queue.get()
-            if self._shutdown_event.is_set():
-                logger.info("Thread %d for transfer type %r finished",
-                            thread_idx, self.transfer_type)
-                return
-
-            logger.debug("Executing %r transfer %d", self.transfer_type,
-                         job_id)
-
+        stream = self.streams[thread_idx]
+        while not self._shutdown_event.is_set():
             try:
-                start_time = time.time()
-                success = self.transfer_fn(transfer_spec)
-                end_time = time.time() - start_time
-                logger.debug("Time taken for %r transfer %d: %f seconds",
-                             self.transfer_type, job_id, end_time)
+                job_id, transfer_spec = self.submission_queue.get(timeout=0.01)
+            except queue.Empty:
+                continue
+            try:
+                with torch.cuda.stream(stream):
+                    start_time = time.time()
+                    success = self.transfer_fn(transfer_spec)
+                    end_time = time.time() - start_time
+                    print(f"Transfer {self.transfer_type} job {job_id} took {end_time:.4f} seconds")
             except Exception as e:
                 logger.warning("Exception in %r transfer %d: %r",
-                               self.transfer_type,
-                               job_id,
-                               e,
-                               exc_info=True)
+                            self.transfer_type,
+                            job_id,
+                            e,
+                            exc_info=True)
                 success = False
 
             logger.debug("Result of %r transfer %d: %r", self.transfer_type,
-                         job_id, success)
+                        job_id, success)
             self.completion_queue.put((job_id, success))
 
     def initiate_shutdown(self):
         self._shutdown_event.set()
-
-        # Ensure thread not blocked by submission_queue.get()
-        dummy_reference: list[LoadStoreSpec] = []
-        dummy_transfer = (-1, (dummy_reference, dummy_reference))
-        for _ in range(self.num_threads):
-            self.submission_queue.put(dummy_transfer)
 
     def wait_for_shutdown(self):
         for t in self._worker_threads:

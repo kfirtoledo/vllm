@@ -127,5 +127,5 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         assert self._gpu_to_cpu_func is not None
         assert self._cpu_to_gpu_func is not None
-        yield GPULoadStoreSpec, CPULoadStoreSpec, self._gpu_to_cpu_func, 1
-        yield CPULoadStoreSpec, GPULoadStoreSpec, self._cpu_to_gpu_func, 1
+        yield GPULoadStoreSpec, CPULoadStoreSpec, self._gpu_to_cpu_func, 8
+        yield CPULoadStoreSpec, GPULoadStoreSpec, self._cpu_to_gpu_func, 8
