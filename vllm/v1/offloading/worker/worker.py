@@ -3,7 +3,7 @@
 import queue
 import threading
 from typing import Callable
-
+import time
 from vllm.logger import init_logger
 from vllm.v1.offloading.abstract import LoadStoreSpec
 
@@ -70,7 +70,11 @@ class OffloadingWorker:
                          job_id)
 
             try:
+                start_time = time.time()
                 success = self.transfer_fn(transfer_spec)
+                end_time = time.time() - start_time
+                logger.debug("Time taken for %r transfer %d: %f seconds",
+                             self.transfer_type, job_id, end_time)
             except Exception as e:
                 logger.warning("Exception in %r transfer %d: %r",
                                self.transfer_type,
