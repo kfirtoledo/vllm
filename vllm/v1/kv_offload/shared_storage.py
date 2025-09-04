@@ -82,6 +82,14 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
                 max_concurrency=self.threads_per_request,
             )
 
+            attn_backend = get_attn_backend(
+                self.vllm_config.model_config.get_head_size(),
+                self.vllm_config.model_config.dtype,
+                self.vllm_config.cache_config.cache_dtype,
+                self.gpu_block_size,
+                self.vllm_config.model_config.is_attention_free,
+                use_mla=self.vllm_config.model_config.use_mla)
+
             self._shared_to_gpu_func = generate_get_transfer_function(
                 dst_tensors=gpu_caches,
                 gpu_blocks_per_file=self.gpu_blocks_per_file,
@@ -91,6 +99,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
                 dtype=self.vllm_config.cache_config.cache_dtype,
                 root_dir=self.shared_storage_path,
                 max_concurrency=self.threads_per_request,
+                attn_backend=attn_backend
             )
 
         assert self._gpu_to_shared_func is not None
