@@ -23,7 +23,7 @@ def get_kv_cache_base_path(
     tp_size: int,
     tp_rank: int,
     dtype: torch.dtype,
-    root_dir: str = "/mnt/shared-kv",
+    root_dir: str = "/tmp/shared-kv",
 ) -> Path:
     """Return the base directory for KV cache files and ensure it exists."""
     dtype_str = str(dtype).replace("torch.", "")
