@@ -17,6 +17,7 @@ from vllm.v1.offloading.worker.shared_storage import (
 from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
 
 TMP_DIR = "/tmp/shared-kv-test"
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
 # ----------------------------
 # Helpers functions
@@ -26,7 +27,7 @@ def create_dummy_kv_tensors(num_layers: int, num_blocks: int, block_size: int, n
     """Create dummy KV cache tensors [K, V] for all layers with shape (2, num_blocks, num_heads, block_size, head_size)."""
     torch.manual_seed(seed)
     shape = (2, num_blocks, num_heads, block_size, head_size)
-    return [torch.rand(shape, dtype=dtype) for _ in range(num_layers)]
+    return [torch.rand(shape, dtype=dtype, device="cuda") for _ in range(num_layers)]
 
 def get_prefix_hash(token_ids):
     """Generate a stable 64-bit hash for a list of token IDs by packing each as uint32."""
@@ -104,7 +105,8 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
         assert os.path.exists(get_file_name(base_path, h)), "missing file after PUT"
 
     # GET phase: load KV blocks back from shared storage
-    get_fn = generate_get_transfer_function(dst_tensors=restored, gpu_blocks_per_file=group_size, model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency)
+    attn_backend = FlashAttentionBackend
+    get_fn = generate_get_transfer_function(dst_tensors=restored, gpu_blocks_per_file=group_size, model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency,attn_backend=attn_backend)
     start_get = time.time()
     # Create GPU specs and storage specs for the read operation
     read_gpu_specs = make_gpu_specs(read_block_ids)

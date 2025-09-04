@@ -1,12 +1,14 @@
 import os
 import time
 import math
+import mmap
+import numpy as np
+import torch
+
 from pathlib import Path
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import numpy as np
-import torch
 from vllm.v1.offloading.worker.worker import TransferFunction, TransferSpec
 from vllm.logger import init_logger
 
@@ -46,36 +48,25 @@ def get_file_name(base_path: Path, block_hash: int) -> Path:
 # Synchronous helpers
 # -----------------------
 
-def get_block_offset(dst_tensors: list[torch.Tensor]) -> int:
-    """Get the byte offset for a given block tensor."""
-    block_size_bytes = 0
-    for tensor in dst_tensors:
-        block = tensor[:, 0]  # Use block 0 to get the shape
-        block_size_bytes += block.numel() * block.element_size()
-    return block_size_bytes
-
-
 def convert_tensors_to_bytes(
     src_tensors: List[torch.Tensor],
     block_ids_list: List[int],
 ) -> memoryview:
-    """Serialize selected [K,V] blocks from all layers to a contiguous CPU buffer.
-
-    Layout: for each block_id in order, for each layer tensor in order, write [2, heads, block, head_size].
-    """
+    """Serialize selected [K,V] blocks from all layers to a contiguous CPU buffer."""
     blocks = []
+    # Collect [K,V] slices for every (layer, block_id) into a list
     for block_id in block_ids_list:
         for tensor in src_tensors:
             blocks.append(tensor[:, block_id])  # [2, H, B, D]
 
-    flat = torch.cat(blocks, dim=0)  # concat along first dim
-    # Ensure contiguous and on CPU
-    flat = flat.contiguous().detach().cpu()
+    # Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
+    flat = torch.cat(blocks, dim=0)
+    flat = flat.contiguous().detach().cpu() # Ensure contiguous and on CPU
 
-    # If storing bf16, write as uint16 payload
-    if flat.dtype == torch.bfloat16:
+    if flat.dtype == torch.bfloat16: # If storing bf16, write as uint16 payload
         flat = flat.view(torch.uint16)
 
+    # Zero-copy: expose tensor bytes as a NumPy view wrapped in memoryview for fast I/O
     return memoryview(flat.numpy())
 
 
@@ -92,76 +83,101 @@ def torch_dtype_to_numpy(dtype) -> np.dtype:
     return mapping[dtype]
 
 
+# -----------------------
+# New tensor-first restore using swap_blocks_multi_layer
+# -----------------------
 
-def convert_bytes_to_tensors(
-    buffer: bytes,
+def convert_file_to_tensors_with_swap(
+    buf: bytes,
     dst_tensors: List[torch.Tensor],
     block_ids_list: List[int],
-    block_offset: int,
-    gpu_blocks_per_file: int
+    gpu_blocks_per_file: int,
+    attn_backend,
 ) -> None:
-    """Restore bytes into destination tensors by block ids.
+    """Restore blocks from file into destination tensors using swap_blocks_multi_layer."""
 
-    Mirrors convert_tensors_to_bytes layout exactly. No offsets or padding.
-    """
-    reshaped_blocks: list[list[torch.Tensor]] = []  # [tensor_index][block_index]
+    # Wrap raw buffer in a memoryview (zero-copy access to bytes)
+    buf_mv = memoryview(buf)
 
-    mv = memoryview(buffer)
-    offset = 0
+    # Shape of one KV block (K and V): [2, num_heads, block_size, head_dim]
+    block_shape = dst_tensors[0][:, 0].shape # (2, H, B, D)
+    elems_per_block = np.prod(block_shape)  # number of elements in one block
+
+    num_layers = len(dst_tensors)          # how many layers total
+    num_blocks = gpu_blocks_per_file       # how many block IDs
+    expected_size = elems_per_block * num_layers * num_blocks  # total elems in file
+
+    # Map torch dtype → numpy dtype (e.g., float16 → np.float16)
+    np_dtype = torch_dtype_to_numpy(dst_tensors[0].dtype)
+    # Interpret raw buffer as 1D NumPy array (zero-copy view)
+    np_arr = np.frombuffer(buf_mv, dtype=np_dtype)
+
+    # Sanity check: file size must match what we expect
+    full_block = len(block_ids_list) % gpu_blocks_per_file == 0
     assert len(block_ids_list) <= gpu_blocks_per_file # length should be smaller
-    if len(block_ids_list) % gpu_blocks_per_file != 0:
-        offset = block_offset *(gpu_blocks_per_file - len(block_ids_list)) # If not full blocks, start at the offset
+    if np_arr.size != expected_size and full_block:
+        raise ValueError(
+            f"File has {np_arr.size} elements but expected {expected_size} "
+            f"({num_blocks} blocks × {num_layers} layers × {elems_per_block} elems/block)"
+        )
 
-    # Step 1: Parse and reshape blocks from buffer
-    #start_time = time.time()
-    for block_id in block_ids_list:
-        tensor_blocks = []
-        for tensor in dst_tensors:
-            block = tensor[:, block_id]
-            num_bytes = block.numel() * block.element_size()
-            mv_block = mv[offset:offset + num_bytes]
-            offset += num_bytes
+    # Reshape into [num_blocks, num_layers, 2, H, B, D] for easy indexing
+    np_arr = np_arr.reshape(num_blocks, num_layers, *block_shape)
+    torch_arr = torch.from_numpy(np_arr)  # Wrap as Torch tensor (still zero-copy)
 
-            np_dtype = torch_dtype_to_numpy(block.dtype)
-            np_arr = np.frombuffer(mv_block, dtype=np_dtype).reshape(block.shape)
-            src = torch.from_numpy(np_arr)
+    # Special case: if data was stored as uint16 (for bf16), reinterpret back to bf16
+    if dst_tensors[0].dtype == torch.bfloat16 and torch_arr.dtype != torch.bfloat16:
+        torch_arr = torch_arr.view(torch.bfloat16)
 
-            if block.dtype is torch.bfloat16 and src.dtype != torch.bfloat16:
-                src = src.view(torch.bfloat16)
+    # Calculate first block offset
+    offset = 0
+    if not full_block:
+        offset = gpu_blocks_per_file - len(block_ids_list) # If not full blocks, start at the offset
 
-            tensor_blocks.append(src)
-        reshaped_blocks.append(tensor_blocks)
-    #end_time = time.time() - start_time
-    #print(f"convert_bytes_to_tensors: step 1 - parse and reshape blocks: {end_time} seconds")
-    # Step 2: Copy into destination tensors
-    #start_time = time.time()
-    for i, block_id in enumerate(block_ids_list):
-        for j, tensor in enumerate(dst_tensors):
-            block = tensor[:, block_id]
-            src = reshaped_blocks[i][j]
+    # Build list of per-layer tensors, each shaped [2, num_blocks, H, B, D]
+    src_tensors: list[torch.Tensor] = []
+    for i in range(num_layers):
+        blocks_for_layer = []
+        for b in range(offset,num_blocks):
+            block_tensor = torch_arr[b, i]  # one block for this layer [2, H, B, D]
+            blocks_for_layer.append(block_tensor)
+        # Stack all blocks along dim=1 → [2, num_blocks, H, B, D]
+        layer_tensor = torch.stack(blocks_for_layer, dim=1).contiguous()
+        src_tensors.append(layer_tensor)
 
-            if src.dtype != block.dtype or src.device != block.device:
-                src = src.to(device=block.device, dtype=block.dtype, non_blocking=True)
+    # Mapping: (source block index, destination block index)
 
-            block.copy_(src)
-    #end_time = time.time() - start_time
-    #print(f"convert_bytes_to_tensors: step 2 - copy reshaped blocks into destination tensors: {end_time} seconds")
+    src_to_dst = torch.tensor(
+        [(i, bid) for i, bid in enumerate(block_ids_list)],
+        dtype=torch.int64,
+        device="cpu",
+    )
 
+    # Perform optimized block transfer (GPU kernel if available, else CPU)
+    if torch.cuda.is_available():
+        with torch.cuda.stream(torch.cuda.Stream()):  # async CUDA stream
+            attn_backend.swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst)
+    else:
+        attn_backend.swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst)
+
+
+# -----------------------
+# File I/O helpers
+# -----------------------
 def write_buffer_to_file(target_file: Path, buffer: memoryview) -> None:
-    """Atomically write a buffer to target_file on POSIX systems."""
     tmp_file_path = target_file.with_suffix(".tmp")
     with open(tmp_file_path, "wb") as f:
         f.write(buffer)
-        f.flush()               # Flush Python's internal I/O buffers to the OS
-        os.fsync(f.fileno())    # Force the OS to flush its write cache to disk for durability
+        f.flush()             # Flush Python's internal I/O buffers to the OS
+        os.fsync(f.fileno())  # Force the OS to flush its write cache to disk for durability
     os.replace(tmp_file_path, target_file)
 
-import mmap
+
 def read_file_to_bytes(path: Path):
     f = open(path, "rb")
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    # return both so caller can mm.close(); f.close() after conversion
     return mm, f
+
 
 # -----------------------------
 # Flexible PUT (thread pool)
@@ -172,12 +188,12 @@ def generate_put_transfer_function(
     tp_size: int,
     tp_rank: int,
     src_tensors: List[torch.Tensor],
-    gpu_blocks_per_file: int,  # number of GPU blocks per file
+    gpu_blocks_per_file: int,
     dtype: torch.dtype,
     root_dir: str,
     max_concurrency: int,
 ) -> TransferFunction:
-    """Create a TransferFunction that writes blocks to shared storage using a thread pool."""
+    """Write blocks to shared storage using a thread pool."""
     base_path = get_kv_cache_base_path(
         model_name=model_name,
         tp_size=tp_size,
@@ -189,20 +205,11 @@ def generate_put_transfer_function(
     def _write_group_sync(dst_spec, block_ids: List[int]) -> bool:
         block_hash = dst_spec.block_hash
         target_file = get_file_name(base_path, block_hash)
-
         if os.path.exists(target_file):
             return True
-
         try:
-            #start_put = time.time()
             buf = convert_tensors_to_bytes(src_tensors, block_ids)
-            #end_put = time.time() - start_put
-            #print(f"Time taken to convert tensors to bytes for {target_file}: {end_put} seconds")
-
-            #start_write = time.time()
             write_buffer_to_file(target_file, buf)
-            #end_write = time.time() - start_write
-            #print(f"Time taken to write file {target_file}: {end_write} seconds")
             return True
         except Exception as e:
             logger.warning("PUT failed for %s: %r", target_file, e)
@@ -214,14 +221,11 @@ def generate_put_transfer_function(
             return False
 
     def transfer_function(spec: TransferSpec) -> bool:
-        """Entry point used by the worker to perform PUT."""
         src_specs, dst_specs = spec
         if not dst_specs:
             return True
 
-        # Pack gpu_blocks_per_file source specs into each destination spec, in order.
         futs = []
-        #start_transfer = time.time()
         with ThreadPoolExecutor(max_workers=max_concurrency or os.cpu_count()) as pool:
             for i, dst_spec in enumerate(dst_specs):
                 start = i * gpu_blocks_per_file
@@ -234,28 +238,27 @@ def generate_put_transfer_function(
             ok = True
             for f in as_completed(futs):
                 ok = ok and bool(f.result())
-            #end_transfer = time.time() - start_transfer
-            #print(f"Time taken to put transfer {end_transfer} seconds")
             return ok
 
     return transfer_function
 
 
 # -----------------------------
-# Flexible GET (thread pool)
+# Flexible GET (thread pool) using swap
 # -----------------------------
 
 def generate_get_transfer_function(
     dst_tensors: List[torch.Tensor],
-    gpu_blocks_per_file: int,  # number of destination blocks per file
+    gpu_blocks_per_file: int,
     model_name: str,
     tp_size: int,
     tp_rank: int,
     dtype: torch.dtype,
     root_dir: str,
     max_concurrency: int,
+    attn_backend=None,   ### CHANGED: pass backend in
 ) -> TransferFunction:
-    """Create a TransferFunction that reads blocks from shared storage using a thread pool."""
+    """Read blocks from shared storage using a thread pool and swap_blocks_multi_layer."""
     base_path = get_kv_cache_base_path(
         model_name=model_name,
         tp_size=tp_size,
@@ -264,53 +267,45 @@ def generate_get_transfer_function(
         root_dir=root_dir,
     )
 
-    block_offset = get_block_offset(dst_tensors)
-
-
     def _read_group_sync(src_spec, block_ids: List[int]) -> bool:
-        block_hash = src_spec.block_hash
-        path = get_file_name(base_path, block_hash)
+        path = get_file_name(base_path, src_spec.block_hash)
 
         try:
-            start_put = time.time()
+            #start_put = time.time()
             buf, f = read_file_to_bytes(path)
-            end_put = time.time()- start_put
-            print(f"Time taken to read file {path}: {end_put} seconds")
+            #end_put = time.time()- start_put
+            #print(f"Time taken to read file {path}: {end_put} seconds")
         except Exception as e:
             logger.warning("GET read failed for %s: %r", path, e)
             return False
 
         try:
-            #start_convert = time.time()
-            convert_bytes_to_tensors(buf, dst_tensors, block_ids, block_offset, gpu_blocks_per_file)
+            #t0 = time.time()
+            convert_file_to_tensors_with_swap(buf, dst_tensors, block_ids, gpu_blocks_per_file, attn_backend)
+            #print(f"Restored {len(block_ids)} blocks from {path} in {time.time()-t0:.4f}s")
             #end_convert = time.time() - start_convert
             #print(f"Time taken to convert bytes to tensors for {path}: {end_convert} seconds")
             return True
         except Exception as e:
-            logger.warning("GET convert failed for %s: %r", path, e)
-            return False
+             logger.warning("GET convert failed for %s: %r", path, e)
+             return False
         finally:
             buf.close()
             f.close()
 
+
     def transfer_function(spec: TransferSpec) -> bool:
-        """Entry point used by the worker to perform GET."""
         src_specs, dst_specs = spec
-        # Each src file corresponds to up to gpu_blocks_per_file destination blocks
         expected_src = math.ceil(len(dst_specs) / gpu_blocks_per_file) if dst_specs else 0
         assert len(src_specs) == expected_src, (
-            f"Mismatch sizes of source spec {len(src_specs)} and destination specs {len(dst_specs)}, "
-            f"gpu_blocks_per_file {gpu_blocks_per_file}"
+            f"Mismatch source spec {len(src_specs)} vs dst {len(dst_specs)}"
         )
-
         if not src_specs:
             return True
 
         futs = []
-        # The first group may be partial, so calculate its length
         first_len = len(dst_specs) % gpu_blocks_per_file or gpu_blocks_per_file
-        start=0
-        #start_transfer = time.time()
+        start = 0
         with ThreadPoolExecutor(max_workers=max_concurrency or os.cpu_count()) as pool:
             for i, src_spec in enumerate(src_specs):
                 size = first_len if i == 0 else gpu_blocks_per_file
@@ -320,11 +315,10 @@ def generate_get_transfer_function(
                 block_ids = [dst_specs[j].block_id for j in range(start, end)]
                 futs.append(pool.submit(_read_group_sync, src_spec, block_ids))
                 start += size
+
             ok = True
             for f in as_completed(futs):
                 ok = ok and bool(f.result())
-            #end_transfer = time.time() - start_transfer
-            #print(f"Time taken to get transfer {end_transfer} seconds")
             return ok
 
     return transfer_function
