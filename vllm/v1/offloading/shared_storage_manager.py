@@ -20,7 +20,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
     """
     An SharedStorageOffloadingManager for managing offloading to shared storage.
     """
-    def __init__(self, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str = "/mnt/shared-kv") -> None:
+    def __init__(self, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str = "/tmp/shared-kv") -> None:
         self.model_name = model_name
         self.tp_size = tp_size
         self.tp_rank = tp_rank
