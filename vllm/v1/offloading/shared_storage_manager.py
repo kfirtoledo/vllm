@@ -99,10 +99,11 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         For shared storage, storing is stateless — no action needed.
         """
-        if not is_success: # TODO- Check if this is needed
-            # If storing failed, need to clean up the files
-            for block_hash in block_hashes:
-                path = get_file_name(self.base_path, block_hash)
-                if os.path.exists(path):
-                    os.remove(path)
+        pass
+        # if not is_success: # TODO- Check if this is needed
+        #     # If storing failed, need to clean up the files
+        #     for block_hash in block_hashes:
+        #         path = get_file_name(self.base_path, block_hash)
+        #         if os.path.exists(path):
+        #             os.remove(path)
         # Otherwise, files are already saved and no further action is needed.

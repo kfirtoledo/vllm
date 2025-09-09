@@ -9,7 +9,7 @@ from vllm.utils import is_pin_memory_available
 from vllm.v1.offloading.abstract import LoadStoreSpec
 from vllm.v1.offloading.mediums import BlockIDLoadStoreSpec
 from vllm.v1.offloading.worker.worker import TransferFunction, TransferSpec
-
+import time
 
 def create_cpu_tensors(
     gpu_kv_caches: dict[str, torch.Tensor],
@@ -136,6 +136,7 @@ def generate_tensors_transfer_function(
                                   device="cpu",
                                   dtype=torch.int64).view(-1, 2)
 
+        start_time = time.time()
         if torch.cuda.is_available():
             # Use CUDA stream
             with torch.cuda.stream(cuda_stream):
@@ -145,6 +146,8 @@ def generate_tensors_transfer_function(
             # Run directly without stream
             attn_backend.swap_blocks_multi_layer(
                 src_tensors, dst_tensors, src_to_dst)
+        end_time = time.time() - start_time
+        print(f"[CPU]Time swap_blocks taken to transfer {end_time} seconds")
 
         # always successful
         return True

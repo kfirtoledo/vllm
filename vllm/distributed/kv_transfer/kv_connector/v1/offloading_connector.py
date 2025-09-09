@@ -27,7 +27,7 @@ from vllm.v1.offloading.worker.worker import (OffloadingQueueManager,
                                               TransferSpec)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
-
+import time
 ReqId = str
 
 logger = init_logger(__name__)
@@ -62,8 +62,11 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata,
                           OffloadingConnectorMetadata)
+        start_time = time.time()
+        req_id=self._connector_metadata.reqs_to_load.keys()
         self.connector_worker.start_load_kv(self._connector_metadata)
-
+        end_time = time.time() - start_time
+        print(f"[OFFLOADING]Time taken to start load kv {end_time} seconds req.id {req_id}")
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 
@@ -422,6 +425,7 @@ class OffloadingConnectorWorker:
             self._unregistered_gpu_kv_caches = {}
 
         for req_id, transfer_spec in metadata.reqs_to_load.items():
+            print(f"req.id {req_id}, transfer_spec {transfer_spec}")
             job_id = self._generate_job_id()
             self._jobs[job_id] = (req_id, False)
             self._load_jobs[req_id].add(job_id)
@@ -475,5 +479,6 @@ class OffloadingConnectorWorker:
             elif pending_req_jobs is not None:
                 finished_sending.add(req_id)
                 del self._store_jobs[req_id]
-
+        if finished_recving != set() or finished_sending != set():
+            print(f"[OFFLOADING]Finished sending: {finished_sending}, finished receiving: {finished_recving}")
         return finished_sending, finished_recving
