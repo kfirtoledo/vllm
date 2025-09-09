@@ -11,14 +11,13 @@ from vllm.v1.offloading.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.offloading.mediums import GPULoadStoreSpec, SharedStorageLoadStoreSpec
 from vllm.v1.offloading.shared_storage_manager import SharedStorageOffloadingManager
 from vllm.v1.offloading.spec import OffloadingSpec
-from vllm.v1.offloading.worker.cpu import (
-    create_cpu_tensors,
-)
+
 from vllm.v1.offloading.worker.shared_storage import (
-    generate_put_transfer_function,
-    generate_get_transfer_function,
+    GPUStorageOffloadingHandler,
+    StorageGPUOffloadingHandler,
 )
-from vllm.v1.offloading.worker.worker import TransferFunction
+
+from vllm.v1.offloading.worker.worker import OffloadingHandler
 
 
 class SharedStorageOffloadingSpec(OffloadingSpec):
@@ -31,13 +30,15 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self._num_blocks: Optional[int] = None
         self._manager: Optional[OffloadingManager] = None
 
-        self._gpu_to_shared_func: Optional[TransferFunction] = None
-        self._shared_to_gpu_func: Optional[TransferFunction] = None
         self.shared_storage_path   = self.extra_config.get("shared_storage_path", "/tmp/shared-kv")
         self.threads_per_request   = self.extra_config.get("threads_per_request", 16) # Threads used for processing a single request
-        self.max_parallel_requests = self.extra_config.get("max_parallel_requests", 8) # Limit for concurrent requests across the whole system
+        # self.max_parallel_requests = self.extra_config.get("max_parallel_requests", 8) # Limit for concurrent requests across the whole system
         self.gpu_blocks_per_file   = int(self.offloaded_block_size / self.gpu_block_size)
         assert self.offloaded_block_size % self.gpu_block_size == 0, "offloaded_block_size must be a multiple of gpu_block_size"
+
+        self._manager: Optional[OffloadingManager] = None
+        self._gpu_to_storage: Optional[OffloadingHandler] = None
+        self._storage_to_gpu: Optional[OffloadingHandler] = None
 
     @property
     def num_blocks(self) -> int:
@@ -57,52 +58,42 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
             )
         return self._manager
 
-    def get_transfer_functions(
-        self,
-        kv_caches: dict[str, torch.Tensor]
-    ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], TransferFunction]]:
+    def get_handlers(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
 
-        if not self._gpu_to_shared_func or not self._shared_to_gpu_func:
 
-            gpu_caches, _ = create_cpu_tensors(
-                kv_caches,
-                self.gpu_block_size,
-                self.offloaded_block_size,
-                self.num_blocks
-            )
+        if not self._gpu_to_storage or not self._storage_to_gpu:
+                attn_backend = get_attn_backend(
+                    self.vllm_config.model_config.get_head_size(),
+                    self.vllm_config.model_config.dtype,
+                    self.vllm_config.cache_config.cache_dtype,
+                    self.gpu_block_size,
+                    self.vllm_config.model_config.is_attention_free,
+                    use_mla=self.vllm_config.model_config.use_mla,
+                )
 
-            self._gpu_to_shared_func = generate_put_transfer_function(
-                model_name=self.vllm_config.model_config.model,
-                tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                tp_rank=self.vllm_config.parallel_config.rank,
-                src_tensors=gpu_caches,
-                gpu_blocks_per_file=self.gpu_blocks_per_file,
-                dtype=self.vllm_config.cache_config.cache_dtype,
-                root_dir=self.shared_storage_path,
-                max_concurrency=self.threads_per_request,
-            )
+                # Worker-side handlers
+                self._gpu_to_storage = GPUStorageOffloadingHandler(
+                    model_name=self.vllm_config.model_config.model,
+                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                    tp_rank=self.vllm_config.parallel_config.rank,
+                    src_tensors=list(kv_caches.values()),
+                    gpu_blocks_per_file=self.gpu_blocks_per_file,
+                    dtype=self.vllm_config.cache_config.cache_dtype,
+                    root_dir=self.shared_storage_path,
+                )
 
-            attn_backend = get_attn_backend(
-                self.vllm_config.model_config.get_head_size(),
-                self.vllm_config.model_config.dtype,
-                self.vllm_config.cache_config.cache_dtype,
-                self.gpu_block_size,
-                self.vllm_config.model_config.is_attention_free,
-                use_mla=self.vllm_config.model_config.use_mla)
+                self._storage_to_gpu = StorageGPUOffloadingHandler(
+                    model_name=self.vllm_config.model_config.model,
+                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                    tp_rank=self.vllm_config.parallel_config.rank,
+                    dtype=self.vllm_config.cache_config.cache_dtype,
+                    gpu_blocks_per_file=self.gpu_blocks_per_file,
+                    attn_backend=attn_backend,
+                    dst_tensors=list(kv_caches.values()),
+                    root_dir=self.shared_storage_path,
+                )
 
-            self._shared_to_gpu_func = generate_get_transfer_function(
-                dst_tensors=gpu_caches,
-                gpu_blocks_per_file=self.gpu_blocks_per_file,
-                model_name=self.vllm_config.model_config.model,
-                tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                tp_rank=self.vllm_config.parallel_config.rank,
-                dtype=self.vllm_config.cache_config.cache_dtype,
-                root_dir=self.shared_storage_path,
-                max_concurrency=self.threads_per_request,
-                attn_backend=attn_backend
-            )
-
-        assert self._gpu_to_shared_func is not None
-        assert self._shared_to_gpu_func is not None
-        yield GPULoadStoreSpec, SharedStorageLoadStoreSpec, self._gpu_to_shared_func, self.max_parallel_requests
-        yield SharedStorageLoadStoreSpec, GPULoadStoreSpec, self._shared_to_gpu_func, self.max_parallel_requests
+        yield GPULoadStoreSpec, SharedStorageLoadStoreSpec, self._gpu_to_storage
+        yield SharedStorageLoadStoreSpec, GPULoadStoreSpec, self._storage_to_gpu
