@@ -887,7 +887,7 @@ def get_cutlass_pplx_moe_mm_data(expert_offsets: torch.Tensor,
     used in CUTLASS-based fused MoE.
 
     The function takes in expert_num_tokens (token count per expert) and
-    non_zero_expert_idxs (consecutive indices of experts with non-zero token 
+    non_zero_expert_idxs (consecutive indices of experts with non-zero token
     counts) and uses them to compute:
     - expert_offsets: Indices that mark at which token index each expert begins
                       its computation.
@@ -1654,10 +1654,10 @@ def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                 block_mapping: torch.Tensor) -> None:
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_mapping)
 
-
+import mycuda
 def swap_blocks_multi_layer(src: list[torch.Tensor], dst: list[torch.Tensor],
                             block_mapping: torch.Tensor) -> None:
-    torch.ops._C_cache_ops.swap_blocks_multi_layer(src, dst, block_mapping)
+    mycuda.swap_blocks_multi_layer(src, dst, block_mapping)
 
 
 def convert_fp8(output: torch.Tensor,
