@@ -10,7 +10,7 @@ from typing import Optional
 from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec
 from vllm.v1.offloading.abstract import (LoadStoreSpec, OffloadingManager,
                                          PrepareStoreOutput,)
-from vllm.v1.offloading.worker.shared_storage import get_kv_cache_base_path, get_file_name
+from vllm.v1.offloading.worker.shared_storage import StorageOffloadingHandler
 from vllm.v1.offloading.lru_manager import BlockStatus
 from vllm.logger import init_logger
 
@@ -26,7 +26,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         self.tp_rank = tp_rank
         self.dtype = dtype
 
-        self.base_path: Path = get_kv_cache_base_path(
+        self.base_path: Path = StorageOffloadingHandler.get_kv_cache_base_path(
             dtype=dtype,
             model_name=model_name,
             tp_size=tp_size,
@@ -38,7 +38,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         hit_count = 0
         for block_hash in block_hashes:
 
-            file_path = get_file_name(self.base_path, block_hash)
+            file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
             if not os.path.exists(file_path):
                 break
             hit_count += 1
@@ -63,7 +63,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         now = time.time()
         for block_id in block_ids:
-            path = get_file_name(self.base_path, block_id)
+            path = StorageOffloadingHandler.get_file_name(self.base_path, block_id)
             try:
                 os.utime(path, (now, -1))  # Set atime to the current time (reading, opening, or executing the file).
             except FileNotFoundError:
@@ -102,7 +102,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         if not is_success: # TODO- Check if this is needed
             # If storing failed, need to clean up the files
             for block_hash in block_hashes:
-                path = get_file_name(self.base_path, block_hash)
+                path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
                 if os.path.exists(path):
                     os.remove(path)
         # Otherwise, files are already saved and no further action is needed.

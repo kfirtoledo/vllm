@@ -8,10 +8,12 @@ import torch
 import pytest
 
 from vllm.v1.offloading.worker.shared_storage import (
-    StorageOffloadingHandler,
-    GPUStorageOffloadingHandler,
-    StorageGPUOffloadingHandler,
+    generate_put_transfer_function,
+    generate_get_transfer_function,
+    get_file_name,
+    get_kv_cache_base_path,
 )
+
 from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
 
 TMP_DIR = "/tmp/shared-kv-test"
@@ -46,9 +48,9 @@ def make_storage_specs(num_files: int):
 
 def cleanup_files(model_name, tp_size, tp_rank, dtype, root_dir, block_hashes):
     """Remove existing files for the provided block hashes."""
-    base_path = StorageOffloadingHandler.get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir)
+    base_path = get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir)
     for h in block_hashes:
-        path = StorageOffloadingHandler.get_file_name(base_path, h)
+        path = get_file_name(base_path, h)
         if os.path.exists(path):
             os.remove(path)
     return base_path
@@ -73,87 +75,54 @@ def log_file_info(base_path, block_hashes):
     """Log information about the files corresponding to the given block hashes."""
     file_sizes = []
     for h in block_hashes:
-        path = StorageOffloadingHandler.get_file_name(base_path, h)
+        path = get_file_name(base_path, h)
         if os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             file_sizes.append(size_mb)
     num_files = len(file_sizes)
     return num_files, file_sizes
 
-
-def wait_for(handler, job_id: int, timeout: float = 2.0):
-    """Wait for a specific job in handler.get_finished() up to timeout seconds."""
-    start = time.time()
-    while time.time() - start < timeout:
-        finished = handler.get_finished()
-        for jid, ok in finished:
-            if jid == job_id:
-                return ok
-        time.sleep(0.01)  # avoid busy-spin
-    raise TimeoutError(f"Job {job_id} did not finish within {timeout}s")
-
-def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype,
-                   root_dir: str, num_layers: int, num_blocks: int,
-                   block_size: int, num_heads: int, head_size: int,
-                   read_block_ids: list[int], write_block_ids: list[int],
-                   group_size: int, max_concurrency: int):
+def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str, num_layers: int, num_blocks: int,
+                   block_size: int, num_heads: int, head_size: int, read_block_ids: list[int], write_block_ids: list[int], group_size: int,max_concurrency:int):
+    """Perform a PUT and GET roundtrip for the specified configuration and validate results."""
 
     original = create_dummy_kv_tensors(num_layers, num_blocks, block_size, num_heads, head_size, dtype)
     restored = [torch.zeros_like(t) for t in original]
+
 
     put_gpu_specs = make_gpu_specs(write_block_ids)
     put_num_files = math.ceil(len(write_block_ids) / group_size)
     put_storage_specs, block_hashes = make_storage_specs(put_num_files)
     base_path = cleanup_files(model_name, tp_size, tp_rank, dtype, root_dir, block_hashes)
 
-    # PUT phase
-    put_handler = GPUStorageOffloadingHandler(
-        model_name=model_name,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        src_tensors=original,
-        gpu_blocks_per_file=group_size,
-        dtype=dtype,
-        max_concurrency=max_concurrency,
-        root_dir=root_dir,
-    )
+    # PUT phase: write KV blocks to shared storage
+    put_fn = generate_put_transfer_function(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, src_tensors=original, gpu_blocks_per_file=group_size, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency)
     start_put = time.time()
-    put_handler.transfer_async(job_id=1, spec=(put_gpu_specs, put_storage_specs))
-    results = put_handler.get_finished()
-    ok_put = wait_for(put_handler, job_id=1, timeout=2.0)
-    assert ok_put, "PUT failed"
+    ok_put = put_fn((put_gpu_specs, put_storage_specs))
     dur_put = time.time() - start_put
+    assert ok_put, "PUT failed"
     for h in block_hashes:
-        assert os.path.exists(StorageOffloadingHandler.get_file_name(base_path, h)), "missing file after PUT"
+        assert os.path.exists(get_file_name(base_path, h)), "missing file after PUT"
 
-    # GET phase
+    # GET phase: load KV blocks back from shared storage
     attn_backend = FlashAttentionBackend
-    get_handler = StorageGPUOffloadingHandler(
-        model_name=model_name,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        dtype=dtype,
-        gpu_blocks_per_file=group_size,
-        attn_backend=attn_backend,
-        dst_tensors=restored,
-        max_concurrency=max_concurrency,
-        root_dir=root_dir,
-    )
+    get_fn = generate_get_transfer_function(dst_tensors=restored, gpu_blocks_per_file=group_size, model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir,max_concurrency=max_concurrency,attn_backend=attn_backend)
     start_get = time.time()
+    # Create GPU specs and storage specs for the read operation
     read_gpu_specs = make_gpu_specs(read_block_ids)
     get_num_files = math.ceil(len(read_block_ids) / group_size)
     start_index = len(put_storage_specs) - get_num_files
     get_storage_specs = put_storage_specs[start_index:]
-    get_handler.transfer_async(job_id=2, spec=(get_storage_specs, read_gpu_specs))
-    ok_get = wait_for(get_handler, job_id=2, timeout=2.0)
+
+    ok_get = get_fn((get_storage_specs, read_gpu_specs))
     dur_get = time.time() - start_get
     assert ok_get, "GET failed"
     assert_blocks_equal(original, restored, read_block_ids)
 
-    # Report
+    # Print results
     write_total_mb = total_block_size_mb(num_layers, num_heads, block_size, head_size, dtype, len(write_block_ids))
     read_total_mb = total_block_size_mb(num_layers, num_heads, block_size, head_size, dtype, len(read_block_ids))
-    file_size_mb = os.path.getsize(StorageOffloadingHandler.get_file_name(base_path, block_hashes[0])) / (1024 * 1024)
+    file_size_mb = os.path.getsize(get_file_name(base_path, block_hashes[0])) / (1024 * 1024)
     num_files = len(block_hashes)
     print(
         f"[INFO] group={group_size} write blocks len: {len(write_block_ids)} read blocks len: {len(read_block_ids)} "
