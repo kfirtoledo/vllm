@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.v1.offloading.worker.worker import OffloadingHandler, TransferSpec, TransferResult
 
 logger = init_logger(__name__)
-
+import time
 
 # ----------------------------------------------------------------------
 # Base Storage Offloading Handler
@@ -59,9 +59,10 @@ class StorageOffloadingHandler(OffloadingHandler):
         os.makedirs(full_path.parent, exist_ok=True)
         return full_path
 
-    # ----------------------------
-    # Futures management
-    # ----------------------------
+
+# ----------------------------
+# Futures management
+# ----------------------------
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
         for job_id, fut in list(self.futures.items()):
@@ -74,7 +75,6 @@ class StorageOffloadingHandler(OffloadingHandler):
                     results.append((job_id, False))
                 del self.futures[job_id]
         return results
-
 
 # ----------------------------------------------------------------------
 # GPU → Storage (PUT)
@@ -92,12 +92,14 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
                     dtype: torch.dtype,
                     max_concurrency: int = None,
                     root_dir: str = "/tmp/shared-kv"):
-            super().__init__(model_name, tp_size, tp_rank, dtype,
+        super().__init__(model_name, tp_size, tp_rank, dtype,
                             gpu_blocks_per_file, max_concurrency, root_dir)
 
-            self.src_tensors = src_tensors
+        self.src_tensors = src_tensors
+        self.write_pool = ThreadPoolExecutor(max_workers=self.max_concurrency)
 
-    def convert_tensors_to_bytes(self,
+    def copy_gpu_tensors_to_buffer(
+        self,
         src_tensors: List[torch.Tensor],
         block_ids_list: List[int],
     ) -> memoryview:
@@ -108,22 +110,27 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             for tensor in src_tensors:
                 blocks.append(tensor[:, block_id])  # [2, H, B, D]
 
+
         # Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
         flat = torch.cat(blocks, dim=0)
-        flat = flat.contiguous().detach().cpu() # Ensure contiguous and on CPU
+        flat_cpu = flat.contiguous().detach().cpu()  # Ensure contiguous
 
-        if flat.dtype == torch.bfloat16: # If storing bf16, write as uint16 payload
-            flat = flat.view(torch.uint16)
+        # Non-blocking copy to pinned CPU memory
+        #flat_cpu = flat.to("cpu")#, non_blocking=True)
+
+        # If you need the buffer right away for writing → sync once
+        #torch.cuda.current_stream().synchronize()
+
+        if flat_cpu.dtype == torch.bfloat16:  # If storing bf16, write as uint16 payload
+            flat_cpu = flat_cpu.view(torch.uint16)
 
         # Zero-copy: expose tensor bytes as a NumPy view wrapped in memoryview for fast I/O
-        return memoryview(flat.numpy())
+        return memoryview(flat_cpu.numpy())
 
     def write_buffer_to_file(self, target_file: Path, buffer: memoryview) -> None:
         tmp_file_path = target_file.with_suffix(".tmp")
         with open(tmp_file_path, "wb") as f:
             f.write(buffer)
-            f.flush()
-            os.fsync(f.fileno())
         os.replace(tmp_file_path, target_file)
 
 
@@ -133,8 +140,10 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         if os.path.exists(target_file):
             return True
         try:
-            buf = self.convert_tensors_to_bytes(self.src_tensors, block_ids)
+            #start_time= time.time()
+            buf = self.copy_gpu_tensors_to_buffer(self.src_tensors, block_ids)
             self.write_buffer_to_file(target_file, buf)
+            #print(f"PUT {block_ids} in {time.time()-start_time:.6f} sec")
             return True
         except Exception as e:
             logger.warning("PUT failed for %s: %r", target_file, e)
@@ -146,27 +155,29 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             return False
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        start_time= time.time()
         src_specs, dst_specs = spec
         if not dst_specs:
             return True
+
         def _job():
             ok = True
             futs = []
-            with ThreadPoolExecutor(max_workers=self.max_concurrency or os.cpu_count()) as pool:
-                for i, dst_spec in enumerate(dst_specs):
-                    start = i * self.gpu_blocks_per_file
-                    end = min((i + 1) * self.gpu_blocks_per_file, len(src_specs))
-                    if start >= len(src_specs):
-                        break
-                    block_ids = [src_specs[j].block_id for j in range(start, end)]
-                    futs.append(pool.submit(self._write_one, dst_spec, block_ids))
+            for i, dst_spec in enumerate(dst_specs):
+                start = i * self.gpu_blocks_per_file
+                end = min((i + 1) * self.gpu_blocks_per_file, len(src_specs))
+                if start >= len(src_specs):
+                    break
+                block_ids = [src_specs[j].block_id for j in range(start, end)]
+                futs.append(self.write_pool.submit(self._write_one, dst_spec, block_ids))
 
-                ok = True
-                for f in as_completed(futs):
-                    ok = ok and bool(f.result())
-                return ok
+            ok = True
+            for f in as_completed(futs):
+                ok = ok and bool(f.result())
+            return ok
 
         self.futures[job_id] = self.pool.submit(_job)
+        print(f"Scheduled PUT job {job_id} with {len(dst_specs)} files in {time.time()-start_time:.6f} sec")
         return True
 
 
@@ -185,49 +196,49 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
                          gpu_blocks_per_file, max_concurrency, root_dir)
         self.attn_backend = attn_backend
         self.dst_tensors = dst_tensors
+        self.reads_pool = ThreadPoolExecutor(max_workers=self.max_concurrency)
 
     def read_file_to_bytes(self, path: Path):
         f = open(path, "rb")
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         return mm, f
 
-    def convert_file_to_tensors_with_swap(
-        self, buf, dst_tensors, block_ids_list, gpu_blocks_per_file, attn_backend
-    ):
+    def copy_buffer_to_gpu_tensors(self, buf, block_ids_list):
         # Wrap raw buffer in a memoryview (zero-copy access to bytes)
         buf_mv = memoryview(buf)
 
         # Shape of one KV block (K and V): [2, num_heads, block_size, head_dim]
-        block_shape = dst_tensors[0][:, 0].shape # (2, H, B, D)
+        block_shape = self.dst_tensors[0][:, 0].shape # (2, H, B, D)
         elems_per_block = np.prod(block_shape)  # number of elements in one block
 
-        num_layers = len(dst_tensors)          # how many layers total
-        num_blocks = gpu_blocks_per_file       # how many block IDs
+        num_layers = len(self.dst_tensors)          # how many layers total
+        num_blocks = self.gpu_blocks_per_file       # how many block IDs
         expected_size = elems_per_block * num_layers * num_blocks  # total elems in file
 
       # Map torch dtype → numpy dtype (e.g., float16 → np.float16)
-        np_dtype = self.torch_dtype_to_numpy(dst_tensors[0].dtype)
+        np_dtype = self.torch_dtype_to_numpy(self.dst_tensors[0].dtype)
         # Interpret raw buffer as 1D NumPy array (zero-copy view)
         np_arr = np.frombuffer(buf_mv, dtype=np_dtype)
 
         # Sanity check: file size must match what we expect
-        full_block = len(block_ids_list) % gpu_blocks_per_file == 0
+        full_block = len(block_ids_list) % self.gpu_blocks_per_file == 0
         if np_arr.size != expected_size and full_block:
             raise ValueError(
                 f"File has {np_arr.size} elements but expected {expected_size}"
             )
-
+        start_time= time.time()
         # Reshape into [num_blocks, num_layers, 2, H, B, D] for easy indexing
         np_arr = np_arr.reshape(num_blocks, num_layers, *block_shape)
         torch_arr = torch.from_numpy(np_arr)
         # Special case: if data was stored as uint16 (for bf16), reinterpret back to bf16
-        if dst_tensors[0].dtype == torch.bfloat16 and torch_arr.dtype != torch.bfloat16:
+        if self.dst_tensors[0].dtype == torch.bfloat16 and torch_arr.dtype != torch.bfloat16:
             torch_arr = torch_arr.view(torch.bfloat16)
-
+        print(f"Loaded {len(block_ids_list)} blocks for {num_layers} layers in {time.time()-start_time:.6f} sec")
+        start_time= time.time()
         # Calculate first block offset
         offset = 0
         if not full_block:
-            offset = gpu_blocks_per_file - len(block_ids_list)  # If not full blocks, start at the offset
+            offset = self.gpu_blocks_per_file - len(block_ids_list)  # If not full blocks, start at the offset
         # Build list of per-layer tensors, each shaped [2, num_blocks, H, B, D]
         src_tensors: list[torch.Tensor] = []
         for i in range(num_layers):
@@ -238,7 +249,7 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
             # Stack all blocks along dim=1 → [2, num_blocks, H, B, D]
             layer_tensor = torch.stack(blocks_for_layer, dim=1).contiguous()
             src_tensors.append(layer_tensor)
-
+        print(f"Prepared {len(block_ids_list)} blocks for {num_layers} layers in {time.time()-start_time:.6f} sec")
         # Mapping: (source block index, destination block index)
 
         src_to_dst = torch.tensor(
@@ -248,11 +259,13 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
         )
 
         # Perform optimized block transfer (GPU kernel if available, else CPU)
+        time_start = time.time()
         if torch.cuda.is_available():
             with torch.cuda.stream(torch.cuda.Stream()):  # async CUDA stream
-                attn_backend.swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst)
+                self.attn_backend.swap_blocks_multi_layer(src_tensors, self.dst_tensors, src_to_dst)
+                #print(f"Swapped {block_ids_list} in {time.time()-time_start:.6f} sec")
         else:
-            attn_backend.swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst)
+            self.attn_backend.swap_blocks_multi_layer(src_tensors, self.dst_tensors, src_to_dst)
 
     def torch_dtype_to_numpy(self,dtype) -> np.dtype:
         mapping = {
@@ -268,22 +281,30 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
 
     def _read_group_sync(self, src_spec, block_ids: List[int]) -> bool:
         path = self.get_file_name(self.base_path, src_spec.block_hash)
-        buf, f = None, None
+
         try:
+            #start_put = time.time()
             buf, f = self.read_file_to_bytes(path)
-            self.convert_file_to_tensors_with_swap(
-                buf, self.dst_tensors, block_ids,
-                self.gpu_blocks_per_file, self.attn_backend
-            )
+            #end_put = time.time()- start_put
+            #print(f"Time taken to read file {path}: {end_put} seconds")
+        except Exception as e:
+            logger.warning("GET read failed for %s: %r", path, e)
+            return False
+        try:
+
+            copy_time_start = time.time()
+            self.copy_buffer_to_gpu_tensors(buf, block_ids)
+            print(f"copy_buffer_to_gpu_tensors taken: {time.time()-copy_time_start:.6f} sec")
             return True
         except Exception as e:
             logger.warning("GET failed for %s: %r", path, e)
             return False
         finally:
-            if buf: buf.close()
-            if f: f.close()
+            buf.close()
+            f.close()
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        time_start = time.time()
         src_specs, dst_specs = spec
         if not src_specs:
             return True  # no-op
@@ -298,19 +319,20 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
             futs = []
             first_len = len(dst_specs) % self.gpu_blocks_per_file or self.gpu_blocks_per_file
             start = 0
-            with ThreadPoolExecutor(max_workers=self.max_concurrency) as inner_pool:
-                for i, src_spec in enumerate(src_specs):
-                    size = first_len if i == 0 else self.gpu_blocks_per_file
-                    end = min(start + size, len(dst_specs))
-                    if start >= len(dst_specs):
-                        break
-                    block_ids = [dst_specs[j].block_id for j in range(start, end)]
-                    futs.append(inner_pool.submit(self._read_group_sync, src_spec, block_ids))
-                    start += size
 
-                for f in as_completed(futs):
-                    ok = ok and bool(f.result())
+            for i, src_spec in enumerate(src_specs):
+                size = first_len if i == 0 else self.gpu_blocks_per_file
+                end = min(start + size, len(dst_specs))
+                if start >= len(dst_specs):
+                    break
+                block_ids = [dst_specs[j].block_id for j in range(start, end)]
+                futs.append(self.reads_pool.submit(self._read_group_sync, src_spec, block_ids))
+                start += size
+
+            for f in as_completed(futs):
+                ok = ok and bool(f.result())
             return ok
 
         self.futures[job_id] = self.pool.submit(_job)
+        print(f"Total GET job {job_id} setup time: {time.time()-time_start:.6f} sec")
         return True
