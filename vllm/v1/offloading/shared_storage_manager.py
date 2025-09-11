@@ -81,8 +81,12 @@ class SharedStorageOffloadingManager(OffloadingManager):
         In shared storage, you can always store new blocks. No eviction required.
         """
         store_specs = []
-
+        block_hashes_to_store = []
         for block_hash in block_hashes:
+            file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
+            if os.path.exists(file_path):
+                continue  # already stored
+            block_hashes_to_store.append(block_hash)
             store_specs.append(
                 SharedStorageLoadStoreSpec(
                     block_hash=block_hash
@@ -90,7 +94,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
             )
 
         return PrepareStoreOutput(
-            block_hashes_to_store=block_hashes,
+            block_hashes_to_store=block_hashes_to_store,
             store_specs=store_specs,
             block_hashes_evicted=[],  # no eviction needed
         )
