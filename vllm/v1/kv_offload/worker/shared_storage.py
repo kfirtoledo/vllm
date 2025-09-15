@@ -9,12 +9,25 @@ import numpy as np
 from pathlib import Path
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
-
+import threading
 from vllm.logger import init_logger
 from vllm.v1.offloading.worker.worker import OffloadingHandler, TransferSpec, TransferResult
 
 logger = init_logger(__name__)
 import time
+
+import psutil
+def get_current_cpu() -> int:
+    """Return the current CPU/core the thread is running on."""
+    if hasattr(os, "sched_getcpu"):
+        try:
+            return os.sched_getcpu()
+        except Exception:
+            pass
+    try:
+        return psutil.Process().cpu_num()
+    except Exception:
+        return -1  # Unknown
 
 # ----------------------------------------------------------------------
 # Base Storage Offloading Handler
@@ -40,6 +53,8 @@ class StorageOffloadingHandler(OffloadingHandler):
         self.max_concurrency = max_concurrency or os.cpu_count()
         self.pool = ThreadPoolExecutor(max_workers=self.max_concurrency)
         self.futures: dict[int, Future] = {}
+        self.futs_files = {}
+
 
     # ----------------------------
     # Shared path helpers
@@ -65,15 +80,23 @@ class StorageOffloadingHandler(OffloadingHandler):
 # ----------------------------
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        for job_id, fut in list(self.futures.items()):
-            if fut.done():
-                try:
-                    ok = fut.result()
-                    results.append((job_id, ok))
-                except Exception as e:
-                    logger.warning("Job %d failed: %r", job_id, e)
-                    results.append((job_id, False))
-                del self.futures[job_id]
+
+        # job_id -> list of futures
+        for job_id, fut_list in list(self.futs_files.items()):
+            # ensure we always have a list
+            if not isinstance(fut_list, list):
+                fut_list = [fut_list]
+
+            # check if all futures for this job are done
+            all_done = all(fut.done() for fut in fut_list if fut is not None)
+
+             # if all done, check if any failed
+            if all_done:
+                results.append((job_id, True))
+                # cleanup after finishing
+                self.futs_files.pop(job_id, None)
+                self.futures.pop(job_id, None)
+
         return results
 
 # ----------------------------------------------------------------------
@@ -135,6 +158,8 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
 
 
     def _write_one(self,dst_spec, block_ids: List[int]) -> bool:
+        cpu_id = get_current_cpu()
+        print(f"[DEBUG] _write_one: handling block {dst_spec.block_hash} on CPU {cpu_id}")
         block_hash = dst_spec.block_hash
         target_file = self.get_file_name(self.base_path, block_hash)
         if os.path.exists(target_file):
@@ -160,7 +185,7 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         if not dst_specs:
             return True
 
-        def _job():
+        def _req():
             ok = True
             futs = []
             for i, dst_spec in enumerate(dst_specs):
@@ -171,16 +196,13 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
                 block_ids = [src_specs[j].block_id for j in range(start, end)]
                 futs.append(self.write_pool.submit(self._write_one, dst_spec, block_ids))
 
-            ok = True
-            for f in as_completed(futs):
-                ok = ok and bool(f.result())
+            print("len fut_list:", len(futs))
+            self.futs_files[job_id] = futs
             return ok
 
-        self.futures[job_id] = self.pool.submit(_job)
+        self.futures[job_id] = self.pool.submit(_req)
         print(f"Scheduled PUT job {job_id} with {len(dst_specs)} files in {time.time()-start_time:.6f} sec")
         return True
-
-
 
 # ----------------------------------------------------------------------
 # Storage → GPU (GET)
@@ -279,7 +301,9 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
         }
         return mapping[dtype]
 
-    def _read_group_sync(self, src_spec, block_ids: List[int]) -> bool:
+
+
+    def _read_one_file(self, src_spec, block_ids: List[int]) -> bool:
         path = self.get_file_name(self.base_path, src_spec.block_hash)
 
         try:
@@ -303,7 +327,10 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
             buf.close()
             f.close()
 
+
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        cpu_id = get_current_cpu()
+        print(f"[DEBUG] Main read transfer_async: job_id {job_id} on CPU {cpu_id}")
         time_start = time.time()
         src_specs, dst_specs = spec
         if not src_specs:
@@ -314,25 +341,27 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
             f"Mismatch source spec {len(src_specs)} vs dst {len(dst_specs)}"
         )
 
-        def _job():
+        def _req():
             ok = True
-            futs = []
             first_len = len(dst_specs) % self.gpu_blocks_per_file or self.gpu_blocks_per_file
             start = 0
-
+            fut=[]
             for i, src_spec in enumerate(src_specs):
                 size = first_len if i == 0 else self.gpu_blocks_per_file
                 end = min(start + size, len(dst_specs))
                 if start >= len(dst_specs):
                     break
                 block_ids = [dst_specs[j].block_id for j in range(start, end)]
-                futs.append(self.reads_pool.submit(self._read_group_sync, src_spec, block_ids))
+                fut.append(self.reads_pool.submit(self._read_one_file, src_spec, block_ids))
+
+                print(f"appended future for job {job_id}, future {i}")
                 start += size
 
-            for f in as_completed(futs):
-                ok = ok and bool(f.result())
+            print("len fut_list:", len(fut))
+            self.futs_files[job_id] = fut
             return ok
 
-        self.futures[job_id] = self.pool.submit(_job)
+
+        self.futures[job_id] = self.pool.submit(_req)
         print(f"Total GET job {job_id} setup time: {time.time()-time_start:.6f} sec")
         return True
