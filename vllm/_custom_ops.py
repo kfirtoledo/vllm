@@ -1654,10 +1654,10 @@ def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                 block_mapping: torch.Tensor) -> None:
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_mapping)
 
-import mycuda
+import storage_offload_ext
 def swap_blocks_multi_layer(src: list[torch.Tensor], dst: list[torch.Tensor],
                             block_mapping: torch.Tensor) -> None:
-    mycuda.swap_blocks_multi_layer(src, dst, block_mapping)
+    storage_offload_ext.swap_blocks_multi_layer(src, dst, block_mapping)
 
 
 def convert_fp8(output: torch.Tensor,
