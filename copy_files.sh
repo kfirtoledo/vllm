@@ -8,7 +8,7 @@ FILES=(
 
   #Shared storage files
   "vllm/v1/offloading/worker/shared_storage.py"
-  # "vllm/v1/offloading/shared_storage.py"
+  "vllm/v1/offloading/shared_storage.py"
   "tests/v1/offloading/test_shared_storage.py"
   # "vllm/v1/offloading/shared_storage_manager.py"
   # "vllm/v1/offloading/mediums.py"
@@ -25,7 +25,9 @@ FILES=(
   #vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
 
   # CUDA
-  # "csrc/setup.py"
+  "csrc/setup_torch.py"
+  "csrc/storage_offload_ext.cu"
+  #"csrc/setup.py"
   # "csrc/cache.h"
   # "csrc/cache_kernels.cu"
   # "csrc/torch_bindings.cpp"
