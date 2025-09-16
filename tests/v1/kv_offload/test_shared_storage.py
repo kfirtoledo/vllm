@@ -15,7 +15,6 @@ from vllm.v1.offloading.worker.shared_storage import (
 from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
 
 TMP_DIR = "/tmp/shared-kv-test"
-from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
 # ----------------------------
 # Helpers functions
@@ -119,7 +118,6 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
     )
     start_put = time.time()
     put_handler.transfer_async(job_id=1, spec=(put_gpu_specs, put_storage_specs))
-    results = put_handler.get_finished()
     ok_put = wait_for(put_handler, job_id=1, timeout=2.0)
     assert ok_put, "PUT failed"
     dur_put = time.time() - start_put
@@ -127,14 +125,12 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
         assert os.path.exists(StorageOffloadingHandler.get_file_name(base_path, h)), "missing file after PUT"
 
     # GET phase
-    attn_backend = FlashAttentionBackend
     get_handler = StorageGPUOffloadingHandler(
         model_name=model_name,
         tp_size=tp_size,
         tp_rank=tp_rank,
         dtype=dtype,
         gpu_blocks_per_file=group_size,
-        attn_backend=attn_backend,
         dst_tensors=restored,
         max_concurrency=max_concurrency,
         root_dir=root_dir,
@@ -181,7 +177,7 @@ def test_shared_storage_roundtrip_param(group_size: int, start_idx: int):
     num_blocks = 8
     write_block_ids = list(range(num_blocks))
     read_block_ids = list(range(start_idx, num_blocks))
-    max_concurrency = 8
+    max_concurrency = 2
     roundtrip_once(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir, num_layers=num_layers,
                    num_blocks=num_blocks, block_size=block_size, num_heads=num_heads, head_size=head_size, read_block_ids=read_block_ids,
                    write_block_ids=write_block_ids, group_size=group_size,max_concurrency=max_concurrency)
