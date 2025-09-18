@@ -30,7 +30,9 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self._manager: Optional[OffloadingManager] = None
 
         self.shared_storage_path   = self.extra_config.get("shared_storage_path", "/tmp/shared-kv")
-        self.max_concurrency       = self.extra_config.get("max_concurrency", None) # Threads used for processing a single request
+        self.max_concurrency       = self.extra_config.get("max_concurrency", None) # MAX CPU threads for IO
+        self.max_pinned_memory_gb        = self.extra_config.get("max_pinned_memory_gb", 50) # Max pinned CPU buffer in GB
+
         self.gpu_blocks_per_file   = int(self.offloaded_block_size / self.gpu_block_size)
         assert self.offloaded_block_size % self.gpu_block_size == 0, "offloaded_block_size must be a multiple of gpu_block_size"
 
@@ -63,25 +65,27 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
 
         if not self._gpu_to_storage or not self._storage_to_gpu:
                 self._gpu_to_storage = GPUStorageOffloadingHandler(
-                    model_name=self.vllm_config.model_config.model,
-                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                    tp_rank=self.vllm_config.parallel_config.rank,
-                    src_tensors=list(kv_caches.values()),
-                    gpu_blocks_per_file=self.gpu_blocks_per_file,
-                    dtype=self.vllm_config.cache_config.cache_dtype,
-                    root_dir=self.shared_storage_path,
-                    max_concurrency=self.max_concurrency,
+                    model_name           = self.vllm_config.model_config.model,
+                    tp_size              = self.vllm_config.parallel_config.tensor_parallel_size,
+                    tp_rank              = self.vllm_config.parallel_config.rank,
+                    src_tensors          = list(kv_caches.values()),
+                    gpu_blocks_per_file  = self.gpu_blocks_per_file,
+                    dtype                = self.vllm_config.cache_config.cache_dtype,
+                    max_concurrency      = self.max_concurrency,
+                    max_pinned_memory_gb = self.max_pinned_memory_gb,
+                    root_dir             = self.shared_storage_path,
                 )
 
                 self._storage_to_gpu = StorageGPUOffloadingHandler(
-                    model_name=self.vllm_config.model_config.model,
-                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                    tp_rank=self.vllm_config.parallel_config.rank,
-                    dtype=self.vllm_config.cache_config.cache_dtype,
-                    gpu_blocks_per_file=self.gpu_blocks_per_file,
-                    dst_tensors=list(kv_caches.values()),
-                    root_dir=self.shared_storage_path,
-                    max_concurrency=self.max_concurrency,
+                    model_name           = self.vllm_config.model_config.model,
+                    tp_size              = self.vllm_config.parallel_config.tensor_parallel_size,
+                    tp_rank              = self.vllm_config.parallel_config.rank,
+                    dtype                = self.vllm_config.cache_config.cache_dtype,
+                    gpu_blocks_per_file  = self.gpu_blocks_per_file,
+                    dst_tensors          = list(kv_caches.values()),
+                    root_dir             = self.shared_storage_path,
+                    max_concurrency      = self.max_concurrency,
+                    max_pinned_memory_gb = self.max_pinned_memory_gb,
                 )
 
         yield GPULoadStoreSpec, SharedStorageLoadStoreSpec, self._gpu_to_storage
