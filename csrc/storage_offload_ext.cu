@@ -23,7 +23,9 @@
 
 namespace py = pybind11;
 
-// Pre-allocated pinned memory pool for faster transfers
+// -------------------------------
+// PinnedMemoryPool for buffers
+// -------------------------------
 struct PinnedMemoryPool {
     std::vector<void*> buffers;
     std::vector<size_t> buffer_sizes;
@@ -69,14 +71,37 @@ struct PinnedMemoryPool {
     }
 };
 
-// Global resources
+// Tracks async job progress and results
+struct JobState {
+    // Futures for each async task in the job
+    std::vector<std::shared_future<bool>> futures;
+    // Number of tasks completed so far
+    std::atomic<int> completed_tasks{0};
+    // Total number of tasks scheduled for this job
+    std::atomic<int> total_tasks{0};
+    // Flag indicating if all tasks succeeded
+    std::atomic<bool> all_success{true};
+};
+// --------------------------------------
+// Global resources - TODO should removed all Global variables
+// --------------------------------------
+// CUDA streams assigned to each worker thread
 static std::vector<at::cuda::CUDAStream> g_streams;
+// Global pinned memory pool for buffer reuse
 static std::unique_ptr<PinnedMemoryPool> g_pinned_pool;
+
+// Thread-local CUDA stream used by the current worker
 static thread_local std::optional<c10::cuda::CUDAStream> thread_stream;
+// Thread-local stream index for mapping worker threads to streams
 static thread_local size_t thread_stream_idx = 0;
 
+// Mutex protecting access to the jobs map
+static std::mutex jobs_mutex;
+// Global map of job_id → JobState, tracking async job progress
+static std::map<int, std::unique_ptr<JobState>> jobs;
+
 // -------------------------------
-// Optimized I/O thread pool with better scheduling
+// I/O thread pool for scheduling
 // -------------------------------
 class IOThreadPool {
 private:
@@ -134,22 +159,16 @@ public:
         return res;
     }
 };
-
+// Global IO thread pool for scheduling async PUT/GET tasks
 static std::unique_ptr<IOThreadPool> g_io_pool;
 
-struct JobState {
-    std::vector<std::shared_future<bool>> futures;
-    std::atomic<int> completed_tasks{0};
-    std::atomic<int> total_tasks{0};
-    std::atomic<bool> all_success{true};
-};
 
-static std::mutex jobs_mutex;
-static std::map<int, std::unique_ptr<JobState>> jobs;
 
 // -------------------------------
 // Initialize resources with pre-allocation
 // -------------------------------
+
+// Initialize IO threads, CUDA streams, and pinned memory pool
 void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size_mb = 256 ,size_t max_pinned_memory_gb = 10) {
     if (!g_io_pool) {
         if (io_threads == 0) {
@@ -182,6 +201,7 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
 // -------------------------------
 // Optimized GPU → CPU copy with zero-copy when possible
 // -------------------------------
+// Copy selected GPU tensor blocks into pinned CPU buffer asynchronously
 torch::Tensor copy_gpu_tensors_to_buffer_async(
     const std::vector<torch::Tensor>& src_tensors,
     const std::vector<int64_t>& block_ids_list,
@@ -199,7 +219,6 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
         }
     }
 
-    // Try to use pinned memory for faster transfer
     auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer();
     size_t required_bytes = total_elements * element_size;
 
@@ -261,8 +280,44 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
 }
 
 // -------------------------------
-// File write helpers - optimized for large writes
+// Status and cleanup
 // -------------------------------
+// Return finished jobs and their success status
+std::vector<std::pair<int, bool>> get_finished_ext() {
+    std::lock_guard<std::mutex> lock(jobs_mutex);
+
+    std::vector<std::pair<int, bool>> results;
+    std::vector<int> to_erase;
+
+    for (auto &kv : jobs) {
+        int job_id = kv.first;
+        auto &job_state = kv.second;
+
+        if (job_state->completed_tasks.load() == job_state->total_tasks.load()) {
+            bool all_ok = job_state->all_success.load();
+            results.emplace_back(job_id, all_ok);
+            to_erase.push_back(job_id);
+        }
+    }
+
+    for (int jid : to_erase) {
+        jobs.erase(jid);
+    }
+    return results;
+}
+
+// Release IO threads, CUDA streams, and pinned pool
+void cleanup_performance_resources() {
+    g_io_pool.reset();
+    g_streams.clear();
+    g_pinned_pool.reset();
+}
+
+//----------------------------------------------------------------------
+// GPU → Storage (PUT)
+// ----------------------------------------------------------------------
+
+// File write helpers - optimized for large writes
 bool flush_one_to_disk_fast(const std::string &target_path,
                             const torch::Tensor &host_buf) {
     const void* data_ptr = host_buf.data_ptr();
@@ -288,12 +343,11 @@ bool flush_one_to_disk_fast(const std::string &target_path,
     return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
 }
 
-// -------------------------------
-// Main async transfer with minimal synchronization
-// -------------------------------
+
+// Async GPU → Storage transfer (PUT)
 bool transfer_async_put_ext(int job_id,
                         std::vector<std::string> target_files,
-                        std::vector<std::vector<torch::Tensor>> all_src_tensors,
+                        std::vector<torch::Tensor> src_tensors,
                         std::vector<std::vector<int64_t>> all_block_ids) {
     init_performance_resources();
 
@@ -303,7 +357,7 @@ bool transfer_async_put_ext(int job_id,
 
     for (size_t i = 0; i < target_files.size(); i++) {
         std::string target = target_files[i];
-        auto src = all_src_tensors[i];
+        auto src = src_tensors;
         auto bids = all_block_ids[i];
 
         auto future = g_io_pool->enqueue([=, job_state = job_state.get()]() -> bool {
@@ -352,40 +406,12 @@ bool transfer_async_put_ext(int job_id,
     return true;
 }
 
-// -------------------------------
-// Status and cleanup
-// -------------------------------
-std::vector<std::pair<int, bool>> get_finished_ext() {
-    std::lock_guard<std::mutex> lock(jobs_mutex);
 
-    std::vector<std::pair<int, bool>> results;
-    std::vector<int> to_erase;
 
-    for (auto &kv : jobs) {
-        int job_id = kv.first;
-        auto &job_state = kv.second;
-
-        if (job_state->completed_tasks.load() == job_state->total_tasks.load()) {
-            bool all_ok = job_state->all_success.load();
-            results.emplace_back(job_id, all_ok);
-            to_erase.push_back(job_id);
-        }
-    }
-
-    for (int jid : to_erase) {
-        jobs.erase(jid);
-    }
-    return results;
-}
-
-void cleanup_performance_resources() {
-    g_io_pool.reset();
-    g_streams.clear();
-    g_pinned_pool.reset();
-}
-
-//StorageGPUOffloadingHandler
-// used to swap blocks between src and dst kv caches
+// ----------------------------------------------------------------------
+// Storage -> GPU (GET)
+// ----------------------------------------------------------------------
+// Swap KV blocks between source and destination tensors (multi-layer)
 void swap_blocks_multi_layer(
     const std::vector<torch::Tensor>& src_kv_caches,
     const std::vector<torch::Tensor>& dst_kv_caches,
@@ -462,6 +488,7 @@ void swap_blocks_multi_layer(
 }
 
 
+// Read a file into a pinned CPU tensor from the pool
 torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     if (!g_pinned_pool) {
         throw std::runtime_error("Pinned memory pool not initialized. Call init_performance_resources first.");
@@ -493,7 +520,7 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
         .device(torch::kCPU)
         .pinned_memory(true);
 
-    // Wrap without copy. Torch will not free pinned_ptr, so we must return it manually later.
+    // Wrap without copy, need free pinned_ptr.
     auto tensor = torch::from_blob(
         pinned_ptr,
         {static_cast<long>(file_size)},
@@ -507,7 +534,7 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     return tensor;
 }
 
-// C++ function that replaces copy_buffer_to_gpu_tensors (calls backend directly)
+// Copy buffer to GPU tensors and swap blocks into place
 bool copy_and_swap_gpu_tensors_ext(
     torch::Tensor buf,                           // raw CPU buffer (uint8 tensor from mmap or read)
     const std::vector<int64_t>& block_ids_list,  // block IDs to load
@@ -632,8 +659,7 @@ bool copy_and_swap_gpu_tensors_ext(
     return true;
 }
 
-
-
+// Async Storage → GPU transfer (GET)
 bool transfer_async_get_ext(
     int job_id,
     std::vector<std::string> source_files,
@@ -696,7 +722,6 @@ bool transfer_async_get_ext(
     return true;
 }
 
-
 // -------------------------------
 // PYBIND11 module
 // -------------------------------
@@ -709,20 +734,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_finished_ext", &get_finished_ext);
 
     m.def("transfer_async_put_ext", &transfer_async_put_ext,
-          "Async transfer with optimized GPU->CPU pipeline",
+          "Async transfer  GPU-> Storage",
           py::arg("job_id"),
           py::arg("target_files"),
           py::arg("all_src_tensors"),
           py::arg("all_block_ids"));
 
-
-    m.def("swap_blocks_multi_layer", &swap_blocks_multi_layer);
-
     m.def("transfer_async_get_ext", &transfer_async_get_ext,
-      "Async GET transfer from disk → GPU tensors",
+      "Async GET transfer from Storage → GPU",
       py::arg("job_id"),
       py::arg("source_files"),
       py::arg("all_block_ids"),
       py::arg("dst_tensors"),
       py::arg("gpu_blocks_per_file"));
+    m.def("swap_blocks_multi_layer", &swap_blocks_multi_layer);
 }

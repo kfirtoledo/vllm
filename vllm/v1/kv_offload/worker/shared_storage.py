@@ -4,33 +4,20 @@ import math
 import os
 import torch
 from pathlib import Path
+import time
+import storage_offload_ext
 
 
 from vllm.logger import init_logger
 from vllm.v1.offloading.worker.worker import OffloadingHandler, TransferSpec, TransferResult
 
 logger = init_logger(__name__)
-import time
-import storage_offload_ext
-
-import psutil
-def get_current_cpu() -> int:
-    """Return the current CPU/core the thread is running on."""
-    if hasattr(os, "sched_getcpu"):
-        try:
-            return os.sched_getcpu()
-        except Exception:
-            pass
-    try:
-        return psutil.Process().cpu_num()
-    except Exception:
-        return -1  # Unknown
 
 # ----------------------------------------------------------------------
 # Base Storage Offloading Handler
 # ----------------------------------------------------------------------
 DEFAULT_MAX_PINNED_MEMORY_GB = 100
-DEFAULT_MAX_CONCURRENCY = 64
+DEFAULT_MAX_CONCURRENCY = 16
 
 class StorageOffloadingHandler(OffloadingHandler):
     """Base handler with common helpers for Storage offloading."""
@@ -60,6 +47,7 @@ class StorageOffloadingHandler(OffloadingHandler):
     # ----------------------------
     @staticmethod
     def get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir: str) -> Path:
+        """Build base path for KV cache storage."""
         dtype_str = str(dtype).replace("torch.", "")
         base_path = Path(f"{root_dir}/{model_name}/tp_{tp_size}/rank_{tp_rank}/{dtype_str}")
         base_path.mkdir(parents=True, exist_ok=True)
@@ -67,6 +55,7 @@ class StorageOffloadingHandler(OffloadingHandler):
 
     @staticmethod
     def get_file_name(base_path: Path, block_hash: int) -> Path:
+        """Return file path for a given block hash."""
         block_hash_hex = f"{block_hash & ((1 << 64) - 1):016x}"
         subfolder1, subfolder2 = block_hash_hex[:8], block_hash_hex[8:16]
         full_path = base_path / subfolder1 / subfolder2 / f"{block_hash_hex}.bin"
@@ -74,6 +63,7 @@ class StorageOffloadingHandler(OffloadingHandler):
         return full_path
 
     def compute_pinned_mb(self,dst_tensors, gpu_blocks_per_file, safety=1.0, min_mb=64, max_mb=None):
+        """Estimate pinned memory size (in MB) needed for transfers."""
         ref = dst_tensors[0]
         block_elems = ref[:, 0].numel()                                  # (2, H, B, D)
         total_elems = block_elems * len(dst_tensors) * gpu_blocks_per_file
@@ -83,18 +73,20 @@ class StorageOffloadingHandler(OffloadingHandler):
         if max_mb: mb = min(mb, max_mb)
         return mb
 
-# ----------------------------
-# Futures management
-# ----------------------------
     def get_finished(self) -> list[TransferResult]:
+        """Poll finished async transfers."""
         return storage_offload_ext.get_finished_ext()
+
     def __del__(self):
+        """Cleanup performance resources on destruction."""
         storage_offload_ext.cleanup_performance_resources()
+
+
 # ----------------------------------------------------------------------
 # GPU → Storage (PUT)
 # ----------------------------------------------------------------------
-
 class GPUStorageOffloadingHandler(StorageOffloadingHandler):
+    """Handler for writing KV blocks from GPU tensors into shared storage."""
     def __init__(self, model_name, tp_size, tp_rank, src_tensors,
                  gpu_blocks_per_file, dtype, max_concurrency=None,
                  max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
@@ -104,6 +96,7 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         self.src_tensors = src_tensors
         self.buffer_size_mb = self.compute_pinned_mb(src_tensors, gpu_blocks_per_file)
 
+        # TODO set different init for each class
         storage_offload_ext.init_performance_resources(
             io_threads=self.max_concurrency,
             pinned_buffer_size_mb=self.buffer_size_mb,
@@ -113,12 +106,15 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         logger.info(f"GPUStorageOffloadingHandler: max_concurrency={self.max_concurrency} pinned_buffer_size_mb={self.buffer_size_mb}")
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
-        time_start = time.time()
+        """Launch async PUT transfers from GPU tensors to files.
+        Prepare arrays containing file paths, GPU block IDs to copy, and the list of GPU tensors."""
+        #time_start = time.time()
         src_specs, dst_specs = spec
         if not dst_specs:
             return True
 
-        target_files, all_src_tensors, all_block_ids = [], [], []
+        target_files    = []
+        all_block_ids   = []
         for i, dst_spec in enumerate(dst_specs):
             start = i * self.gpu_blocks_per_file
             end = min((i + 1) * self.gpu_blocks_per_file, len(src_specs))
@@ -127,13 +123,12 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             block_ids = [src_specs[j].block_id for j in range(start, end)]
             target_file = str(self.get_file_name(self.base_path, dst_spec.block_hash))
             target_files.append(target_file)
-            all_src_tensors.append(self.src_tensors)
             all_block_ids.append(block_ids)
             #print(f"[DEBUG PUT] dst_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
-        stream = self.h2d_stream
+        stream = self.h2d_stream # TODO- check if needed
         with torch.cuda.stream(stream):
             storage_offload_ext.transfer_async_put_ext(
-                job_id, target_files, all_src_tensors, all_block_ids )
+                job_id, target_files, self.src_tensors, all_block_ids )
         #print(f"Total PUT job {job_id} setup time: {time.time()-time_start:.6f} sec")
 
         return True
@@ -152,6 +147,8 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
         self.dst_tensors = dst_tensors
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        """Launch async GET transfers from files to GPU tensors,
+        preparing arrays of file paths, block IDs, and tensors."""
         src_specs, dst_specs = spec
         if not src_specs:
             return True
@@ -172,8 +169,8 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
             source_files.append(str(self.get_file_name(self.base_path, src_spec.block_hash)))
             all_block_ids.append(block_ids)
             start += size
-        stream = self.d2h_stream
 
+        stream = self.d2h_stream # TODO- check if needed
         with torch.cuda.stream(stream):
             storage_offload_ext.transfer_async_get_ext(
                 job_id,
