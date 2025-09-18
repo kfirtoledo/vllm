@@ -55,7 +55,6 @@ struct PinnedMemoryPool {
 
         size_t idx = available_buffers.front();
         available_buffers.pop();
-        std::cout << "[INFO] Allocated buffer " << idx << " from pinned memory pool\n";
         return {buffers[idx], buffer_sizes[idx]};
     }
 
@@ -151,7 +150,7 @@ static std::map<int, std::unique_ptr<JobState>> jobs;
 // -------------------------------
 // Initialize resources with pre-allocation
 // -------------------------------
-void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size_mb = 256) {
+void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size_mb = 256 ,size_t max_pinned_memory_gb = 10) {
     if (!g_io_pool) {
         if (io_threads == 0) {
             io_threads = std::max(4u, std::thread::hardware_concurrency() / 2);
@@ -167,8 +166,12 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
 
         // Pre-allocate pinned memory pool
         size_t buffer_size = pinned_buffer_size_mb * 1024 * 1024;
-        g_pinned_pool = std::make_unique<PinnedMemoryPool>(io_threads * 4, buffer_size);
-
+        size_t max_buffers = std::min(io_threads * 4, (max_pinned_memory_gb * 1024 * 1024 * 1024) / buffer_size);
+        g_pinned_pool = std::make_unique<PinnedMemoryPool>(max_buffers, buffer_size);
+        std::cout << "[INFO] Initializing pinned memory pool with "
+                  << max_buffers << " buffers of size "
+                  << pinned_buffer_size_mb << " MB each (total "
+                  << (max_buffers * pinned_buffer_size_mb) / 1024.0 << " GB)\n";
         // Warm up CUDA context and streams
         for (auto& stream : g_streams) {
             cudaStreamSynchronize(stream.stream());
@@ -231,8 +234,6 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
             cudaMemcpyDeviceToHost,
             stream.stream()
         );
-
-        // Remove synchronize here
 
     } else {
         // Fallback to regular memory
@@ -324,7 +325,6 @@ bool transfer_async_put_ext(int job_id,
 
                 // Stage 3: Write to disk (this is now the only blocking operation)
                 bool ok = flush_one_to_disk_fast(target, host_buf);
-                std::cout << "[DEBUG] Finished writing " << target << " to disk\n";
                 // Return pinned memory to pool if used
                 if (host_buf.is_pinned()) {
                     g_pinned_pool->return_buffer(host_buf.data_ptr());
@@ -664,11 +664,9 @@ bool transfer_async_get_ext(
             try {
                 // Stage 1: Read file into pinned CPU tensor
                 auto host_buf = read_file_to_pinned_tensor(src_file);
-                std::cout << "[DEBUG] Read file " << src_file << " into pinned tensor of size \n";
                 // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
                 bool ok = copy_and_swap_gpu_tensors_ext(
                     host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
-                std::cout << "[DEBUG] Launched copy_and_swap for " << src_file << "\n";
                 // Stage 3: Synchronize the stream to ensure copy finished
                 cudaStreamSynchronize(thread_stream->stream());
 
@@ -676,7 +674,6 @@ bool transfer_async_get_ext(
                 if (host_buf.is_pinned()) {
                     g_pinned_pool->return_buffer(host_buf.data_ptr());
                 }
-                std::cout << "[DEBUG] Finished copy_and_swap for " << src_file << "\n";
                 at::cuda::setCurrentCUDAStream(current_stream);
 
                 job_state->completed_tasks.fetch_add(1);
@@ -705,7 +702,9 @@ bool transfer_async_get_ext(
 // -------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("init_performance_resources", &init_performance_resources,
-          py::arg("io_threads") = 0, py::arg("pinned_buffer_size_mb") = 256);
+          py::arg("io_threads") = 0,
+          py::arg("pinned_buffer_size_mb") = 256,
+          py::arg("max_pinned_memory_gb") = 50);
     m.def("cleanup_performance_resources", &cleanup_performance_resources);
     m.def("get_finished_ext", &get_finished_ext);
 

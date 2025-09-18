@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import math
 import os
 import torch
 from pathlib import Path
+
 
 from vllm.logger import init_logger
 from vllm.v1.offloading.worker.worker import OffloadingHandler, TransferSpec, TransferResult
@@ -28,6 +29,8 @@ def get_current_cpu() -> int:
 # ----------------------------------------------------------------------
 # Base Storage Offloading Handler
 # ----------------------------------------------------------------------
+DEFAULT_MAX_PINNED_MEMORY_GB = 100
+DEFAULT_MAX_CONCURRENCY = 64
 
 class StorageOffloadingHandler(OffloadingHandler):
     """Base handler with common helpers for Storage offloading."""
@@ -39,6 +42,7 @@ class StorageOffloadingHandler(OffloadingHandler):
                  dtype: torch.dtype,
                  gpu_blocks_per_file: int,
                  max_concurrency: int = None,
+                 max_pinned_memory_gb: int = DEFAULT_MAX_PINNED_MEMORY_GB,  # in GB
                  root_dir: str = "/tmp/shared-kv"):
         self.model_name = model_name
         self.tp_size = tp_size
@@ -46,10 +50,10 @@ class StorageOffloadingHandler(OffloadingHandler):
         self.dtype = dtype
         self.gpu_blocks_per_file = gpu_blocks_per_file
         self.base_path = self.get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir)
-        self.max_concurrency = int(max_concurrency or (os.cpu_count()))
+        self.max_concurrency = min(int(max_concurrency or (os.cpu_count())), DEFAULT_MAX_CONCURRENCY)
+        self.max_pinned_memory_gb = max_pinned_memory_gb
         self.h2d_stream = torch.cuda.Stream()
         self.d2h_stream = torch.cuda.Stream()
-
 
     # ----------------------------
     # Shared path helpers
@@ -69,6 +73,15 @@ class StorageOffloadingHandler(OffloadingHandler):
         os.makedirs(full_path.parent, exist_ok=True)
         return full_path
 
+    def compute_pinned_mb(self,dst_tensors, gpu_blocks_per_file, safety=1.0, min_mb=64, max_mb=None):
+        ref = dst_tensors[0]
+        block_elems = ref[:, 0].numel()                                  # (2, H, B, D)
+        total_elems = block_elems * len(dst_tensors) * gpu_blocks_per_file
+        total_bytes = total_elems * ref.element_size()
+        mb = math.ceil((total_bytes / (1024 * 1024)) * safety)
+        if min_mb: mb = max(mb, min_mb)
+        if max_mb: mb = min(mb, max_mb)
+        return mb
 
 # ----------------------------
 # Futures management
@@ -84,11 +97,20 @@ class StorageOffloadingHandler(OffloadingHandler):
 class GPUStorageOffloadingHandler(StorageOffloadingHandler):
     def __init__(self, model_name, tp_size, tp_rank, src_tensors,
                  gpu_blocks_per_file, dtype, max_concurrency=None,
-                 root_dir="/tmp/shared-kv"):
+                 max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
         super().__init__(model_name, tp_size, tp_rank, dtype,
-                         gpu_blocks_per_file, max_concurrency, root_dir)
-        storage_offload_ext.init_performance_resources(io_threads=self.max_concurrency, pinned_buffer_size_mb=512)
+                         gpu_blocks_per_file, max_concurrency, max_pinned_memory_gb, root_dir)
+
         self.src_tensors = src_tensors
+        self.buffer_size_mb = self.compute_pinned_mb(src_tensors, gpu_blocks_per_file)
+
+        storage_offload_ext.init_performance_resources(
+            io_threads=self.max_concurrency,
+            pinned_buffer_size_mb=self.buffer_size_mb,
+            max_pinned_memory_gb=self.max_pinned_memory_gb,  # TODO: separate pools for PUT/GET
+        )
+
+        logger.info(f"GPUStorageOffloadingHandler: max_concurrency={self.max_concurrency} pinned_buffer_size_mb={self.buffer_size_mb}")
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         time_start = time.time()
@@ -107,16 +129,14 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             target_files.append(target_file)
             all_src_tensors.append(self.src_tensors)
             all_block_ids.append(block_ids)
-            print(f"[DEBUG PUT] dst_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
+            #print(f"[DEBUG PUT] dst_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
         stream = self.h2d_stream
         with torch.cuda.stream(stream):
             storage_offload_ext.transfer_async_put_ext(
                 job_id, target_files, all_src_tensors, all_block_ids )
-        print(f"Total PUT job {job_id} setup time: {time.time()-time_start:.6f} sec")
+        #print(f"Total PUT job {job_id} setup time: {time.time()-time_start:.6f} sec")
 
         return True
-
-
 
 # ----------------------------------------------------------------------
 # Storage → GPU (GET)
@@ -126,9 +146,9 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
 
     def __init__(self, model_name, tp_size, tp_rank, dtype,
                  gpu_blocks_per_file, dst_tensors,
-                 max_concurrency=None, root_dir="/tmp/shared-kv"):
+                 max_concurrency=None, max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
         super().__init__(model_name, tp_size, tp_rank, dtype,
-                         gpu_blocks_per_file, max_concurrency, root_dir)
+                         gpu_blocks_per_file, max_concurrency, max_pinned_memory_gb, root_dir)
         self.dst_tensors = dst_tensors
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
@@ -148,7 +168,7 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
 
             end = min(start + size, len(dst_specs))
             block_ids = [dst.block_id for dst in dst_specs[start:end]]
-            print(f"[DEBUG GET] src_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
+            #print(f"[DEBUG GET] src_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
             source_files.append(str(self.get_file_name(self.base_path, src_spec.block_hash)))
             all_block_ids.append(block_ids)
             start += size
