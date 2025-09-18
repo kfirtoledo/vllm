@@ -500,13 +500,11 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
             stream.stream()
         );
 
-<<<<<<< Updated upstream
-=======
+
         // Keep flat_gpu's storage alive until work on `stream` completes
         at::cuda::CUDACachingAllocator::recordStream(
         flat_gpu.storage().data_ptr(), stream);
 
->>>>>>> Stashed changes
     } else {
         // Fallback to regular memory
         if (pinned_ptr) g_pinned_pool->return_buffer(pinned_ptr);
@@ -597,10 +595,8 @@ bool transfer_async_put_ext(int job_id,
 
                 // Stage 3: Write to disk (this is now the only blocking operation)
                 bool ok = flush_one_to_disk_fast(target, host_buf);
-<<<<<<< Updated upstream
-=======
+
                 // std::cout << "[DEBUG] Finished writing " << target << " to disk\n";
->>>>>>> Stashed changes
                 // Return pinned memory to pool if used
                 if (host_buf.is_pinned()) {
                     g_pinned_pool->return_buffer(host_buf.data_ptr());
@@ -959,18 +955,6 @@ bool transfer_async_get_ext(
             try {
                 // Stage 1: Read file into pinned CPU tensor
                 auto host_buf = read_file_to_pinned_tensor(src_file);
-<<<<<<< Updated upstream
-                // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
-                bool ok = copy_and_swap_gpu_tensors_ext(
-                    host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
-                // Stage 3: Synchronize the stream to ensure copy finished
-                cudaStreamSynchronize(thread_stream->stream());
-
-                // Return pinned memory to pool if used
-                if (host_buf.is_pinned()) {
-                    g_pinned_pool->return_buffer(host_buf.data_ptr());
-                }
-=======
                 // std::cout << "[DEBUG] Read file " << src_file << " into pinned tensor of size \n";
                 // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
                 bool ok = copy_and_swap_gpu_tensors_ext(
@@ -980,7 +964,6 @@ bool transfer_async_get_ext(
                 cudaStreamSynchronize(thread_stream->stream());
 
                 // std::cout << "[DEBUG] Finished copy_and_swap for " << src_file << "\n";
->>>>>>> Stashed changes
                 at::cuda::setCurrentCUDAStream(current_stream);
 
                 job_state->completed_tasks.fetch_add(1);
