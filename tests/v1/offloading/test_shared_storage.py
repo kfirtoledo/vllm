@@ -118,7 +118,7 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
     )
     start_put = time.time()
     put_handler.transfer_async(job_id=1, spec=(put_gpu_specs, put_storage_specs))
-    ok_put = wait_for(put_handler, job_id=1, timeout=2.0)
+    ok_put = wait_for(put_handler, job_id=1, timeout=20.0)
     assert ok_put, "PUT failed"
     dur_put = time.time() - start_put
     for h in block_hashes:
@@ -141,7 +141,7 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
     start_index = len(put_storage_specs) - get_num_files
     get_storage_specs = put_storage_specs[start_index:]
     get_handler.transfer_async(job_id=2, spec=(get_storage_specs, read_gpu_specs))
-    ok_get = wait_for(get_handler, job_id=2, timeout=2.0)
+    ok_get = wait_for(get_handler, job_id=2, timeout=30.0)
     dur_get = time.time() - start_get
     assert ok_get, "GET failed"
     assert_blocks_equal(original, restored, read_block_ids)
@@ -174,10 +174,10 @@ def test_shared_storage_roundtrip_param(group_size: int, start_idx: int):
     block_size = 16
     num_heads = 64
     head_size = 128
-    num_blocks = 8
+    num_blocks = 524
     write_block_ids = list(range(num_blocks))
     read_block_ids = list(range(start_idx, num_blocks))
-    max_concurrency = 2
+    max_concurrency = 16
     roundtrip_once(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir, num_layers=num_layers,
                    num_blocks=num_blocks, block_size=block_size, num_heads=num_heads, head_size=head_size, read_block_ids=read_block_ids,
                    write_block_ids=write_block_ids, group_size=group_size,max_concurrency=max_concurrency)

@@ -24,49 +24,313 @@
 namespace py = pybind11;
 
 // Pre-allocated pinned memory pool for faster transfers
-struct PinnedMemoryPool {
+
+class PinnedMemoryPool {
+private:
+    mutable std::mutex pool_mutex;
+    std::condition_variable buffer_available;
+    std::queue<size_t> available_buffers;
     std::vector<void*> buffers;
     std::vector<size_t> buffer_sizes;
-    std::queue<size_t> available_buffers;
-    std::mutex pool_mutex;
 
+    // CRASH PREVENTION: Track allocated buffers
+    std::unordered_set<void*> allocated_buffers;
+    std::unordered_set<size_t> allocated_indices;
+
+    // CRASH PREVENTION: Pool state tracking
+    std::atomic<bool> pool_initialized{false};
+    std::atomic<bool> pool_destroyed{false};
+
+    // CRASH PREVENTION: Statistics for debugging
+    std::atomic<size_t> total_allocations{0};
+    std::atomic<size_t> total_returns{0};
+    std::atomic<size_t> failed_allocations{0};
+    std::atomic<size_t> double_returns{0};
+
+    // CRASH PREVENTION: Maximum wait queue to prevent memory exhaustion
+    static constexpr size_t MAX_WAITING_THREADS = 1000;
+    std::atomic<size_t> waiting_threads{0};
+
+public:
     PinnedMemoryPool(size_t num_buffers, size_t buffer_size) {
-        buffers.reserve(num_buffers);
-        buffer_sizes.reserve(num_buffers);
+        std::vector<void*> buffer_ptrs;
+        std::vector<size_t> sizes;
+
+        buffer_ptrs.reserve(num_buffers);
+        sizes.reserve(num_buffers);
 
         for (size_t i = 0; i < num_buffers; ++i) {
-            void* ptr;
-            cudaMallocHost(&ptr, buffer_size);
-            buffers.push_back(ptr);
-            buffer_sizes.push_back(buffer_size);
-            available_buffers.push(i);
+            void* ptr = nullptr;
+            cudaError_t err = cudaMallocHost(&ptr, buffer_size); // pinned memory
+            if (err != cudaSuccess) {
+                throw std::runtime_error("cudaMallocHost failed at buffer " + std::to_string(i));
+            }
+            buffer_ptrs.push_back(ptr);
+            sizes.push_back(buffer_size);
         }
+
+        initialize_pool(buffer_ptrs, sizes);
     }
 
     ~PinnedMemoryPool() {
-        for (void* ptr : buffers) {
-            cudaFreeHost(ptr);
+        pool_destroyed = true;
+        buffer_available.notify_all();
+
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        print_statistics();
+
+        // Warn about leaked buffers
+        if (!allocated_buffers.empty()) {
+            std::cout << "[ERROR] Pool destroyed with " << allocated_buffers.size()
+                      << " buffers still allocated - MEMORY LEAK!\n";
         }
     }
 
-    std::pair<void*, size_t> get_buffer() {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        if (available_buffers.empty()) return {nullptr, 0};
-
-        size_t idx = available_buffers.front();
-        available_buffers.pop();
-        std::cout << "[INFO] Allocated buffer " << idx << " from pinned memory pool\n";
-        return {buffers[idx], buffer_sizes[idx]};
+    // CRASH PREVENTION: Safe initialization check
+    bool is_initialized() const {
+        return pool_initialized.load() && !pool_destroyed.load();
     }
 
-    void return_buffer(void* ptr) {
+    void initialize_pool(const std::vector<void*>& buffer_ptrs,
+                        const std::vector<size_t>& sizes) {
         std::lock_guard<std::mutex> lock(pool_mutex);
+
+        if (buffer_ptrs.size() != sizes.size()) {
+            throw std::runtime_error("Buffer pointers and sizes vectors must have same size");
+        }
+
+        buffers = buffer_ptrs;
+        buffer_sizes = sizes;
+
+        // Initialize all buffers as available
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (buffers[i] == nullptr) {
+                throw std::runtime_error("Null buffer pointer at index " + std::to_string(i));
+            }
+            available_buffers.push(i);
+        }
+
+        pool_initialized = true;
+        std::cout << "[INFO] Initialized pool with " << buffers.size() << " buffers\n";
+    }
+
+    // CRASH PREVENTION: Robust get_buffer with extensive validation
+    std::pair<void*, size_t> get_buffer(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        // Early checks without lock for performance
+        if (pool_destroyed.load()) {
+            std::cout << "[ERROR] Attempting to get buffer from destroyed pool\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        if (!pool_initialized.load()) {
+            std::cout << "[ERROR] Pool not initialized\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        // Prevent too many waiting threads (DoS protection)
+        if (waiting_threads.load() >= MAX_WAITING_THREADS) {
+            std::cout << "[ERROR] Too many waiting threads (" << waiting_threads.load() << ")\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        std::unique_lock<std::mutex> lock(pool_mutex);
+
+        // Double-check after acquiring lock
+        if (pool_destroyed.load()) {
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        waiting_threads++;
+
+        // Wait for buffer with timeout
+        bool got_buffer = buffer_available.wait_for(lock, timeout, [this] {
+            return !available_buffers.empty() || pool_destroyed.load();
+        });
+
+        waiting_threads--;
+
+        if (pool_destroyed.load()) {
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        if (!got_buffer || available_buffers.empty()) {
+            std::cout << "[WARNING] get_buffer() timed out after " << timeout.count()
+                      << "ms, available=" << available_buffers.size()
+                      << ", allocated=" << allocated_buffers.size() << "\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        // Get buffer
+        size_t idx = available_buffers.front();
+        available_buffers.pop();
+
+        // CRASH PREVENTION: Validate buffer index
+        if (idx >= buffers.size()) {
+            std::cout << "[ERROR] Invalid buffer index " << idx << " >= " << buffers.size() << "\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        void* ptr = buffers[idx];
+
+        // CRASH PREVENTION: Validate buffer pointer
+        if (ptr == nullptr) {
+            std::cout << "[ERROR] Null buffer pointer at index " << idx << "\n";
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        // CRASH PREVENTION: Check for double allocation
+        if (allocated_buffers.find(ptr) != allocated_buffers.end()) {
+            std::cout << "[ERROR] Buffer " << idx << " already allocated - DOUBLE ALLOCATION!\n";
+            available_buffers.push(idx); // Put it back
+            failed_allocations++;
+            return {nullptr, 0};
+        }
+
+        // CRASH PREVENTION: Track allocation
+        allocated_buffers.insert(ptr);
+        allocated_indices.insert(idx);
+        total_allocations++;
+
+        std::cout << "[INFO] Allocated buffer " << idx << " (" << ptr << "), size="
+                  << buffer_sizes[idx] << ", allocated_count=" << allocated_buffers.size() << "\n";
+
+        return {ptr, buffer_sizes[idx]};
+    }
+
+    // CRASH PREVENTION: Robust return_buffer with extensive validation
+    bool return_buffer(void* ptr) {
+        if (ptr == nullptr) {
+            std::cout << "[ERROR] Attempting to return null pointer\n";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(pool_mutex);
+
+        if (pool_destroyed.load()) {
+            std::cout << "[ERROR] Attempting to return buffer to destroyed pool\n";
+            return false;
+        }
+
+        // CRASH PREVENTION: Check if buffer was actually allocated
+        if (allocated_buffers.find(ptr) == allocated_buffers.end()) {
+            std::cout << "[ERROR] Attempting to return non-allocated buffer " << ptr << " - DOUBLE RETURN!\n";
+            double_returns++;
+            return false;
+        }
+
+        // Find the buffer index
+        size_t idx = SIZE_MAX;
         for (size_t i = 0; i < buffers.size(); ++i) {
             if (buffers[i] == ptr) {
-                available_buffers.push(i);
+                idx = i;
                 break;
             }
         }
+
+        if (idx == SIZE_MAX) {
+            std::cout << "[ERROR] Buffer pointer " << ptr << " not found in pool\n";
+            // Remove from allocated set anyway to prevent memory leak
+            allocated_buffers.erase(ptr);
+            return false;
+        }
+
+        // CRASH PREVENTION: Check if already in available queue
+        std::queue<size_t> temp_queue = available_buffers;
+        while (!temp_queue.empty()) {
+            if (temp_queue.front() == idx) {
+                std::cout << "[ERROR] Buffer " << idx << " already in available queue - CORRUPTION!\n";
+                allocated_buffers.erase(ptr);
+                allocated_indices.erase(idx);
+                return false;
+            }
+            temp_queue.pop();
+        }
+
+        // Return buffer to pool
+        available_buffers.push(idx);
+        allocated_buffers.erase(ptr);
+        allocated_indices.erase(idx);
+        total_returns++;
+
+        std::cout << "[INFO] Returned buffer " << idx << " (" << ptr << "), available_count="
+                  << available_buffers.size() << "\n";
+
+        // Notify waiting threads
+        buffer_available.notify_one();
+        return true;
+    }
+
+    // CRASH PREVENTION: Emergency cleanup
+    void emergency_cleanup() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        std::cout << "[WARNING] Emergency cleanup initiated\n";
+
+        print_statistics();
+
+        // Force return all allocated buffers
+        for (size_t idx : allocated_indices) {
+            available_buffers.push(idx);
+        }
+
+        allocated_buffers.clear();
+        allocated_indices.clear();
+        buffer_available.notify_all();
+
+        std::cout << "[INFO] Emergency cleanup completed, all buffers returned\n";
+    }
+
+    // CRASH PREVENTION: Health check
+    bool health_check() const {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+
+        bool healthy = true;
+
+        // Check total buffers
+        size_t total_buffers = available_buffers.size() + allocated_buffers.size();
+        if (total_buffers != buffers.size()) {
+            std::cout << "[ERROR] Buffer count mismatch: total=" << total_buffers
+                      << ", expected=" << buffers.size() << "\n";
+            healthy = false;
+        }
+
+        // Check for null pointers
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (buffers[i] == nullptr) {
+                std::cout << "[ERROR] Null buffer at index " << i << "\n";
+                healthy = false;
+            }
+        }
+
+        // Check statistics consistency
+        if (total_allocations.load() < total_returns.load()) {
+            std::cout << "[ERROR] More returns than allocations!\n";
+            healthy = false;
+        }
+
+        return healthy;
+    }
+
+    void print_statistics() const {
+        std::cout << "\n=== Pool Statistics ===\n";
+        std::cout << "Total buffers: " << buffers.size() << "\n";
+        std::cout << "Available: " << available_buffers.size() << "\n";
+        std::cout << "Allocated: " << allocated_buffers.size() << "\n";
+        std::cout << "Total allocations: " << total_allocations.load() << "\n";
+        std::cout << "Total returns: " << total_returns.load() << "\n";
+        std::cout << "Failed allocations: " << failed_allocations.load() << "\n";
+        std::cout << "Double returns: " << double_returns.load() << "\n";
+        std::cout << "Waiting threads: " << waiting_threads.load() << "\n";
+        std::cout << "Pool initialized: " << pool_initialized.load() << "\n";
+        std::cout << "Pool destroyed: " << pool_destroyed.load() << "\n";
+        std::cout << "======================\n\n";
     }
 };
 
@@ -200,8 +464,8 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
         }
     }
 
-    // Try to use pinned memory for faster transfer
-    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer();
+    // Use pinned memory for faster transfer
+    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer(std::chrono::milliseconds(500));
     size_t required_bytes = total_elements * element_size;
 
     torch::Tensor result_cpu;
@@ -236,6 +500,13 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
             stream.stream()
         );
 
+<<<<<<< Updated upstream
+=======
+        // Keep flat_gpu's storage alive until work on `stream` completes
+        at::cuda::CUDACachingAllocator::recordStream(
+        flat_gpu.storage().data_ptr(), stream);
+
+>>>>>>> Stashed changes
     } else {
         // Fallback to regular memory
         if (pinned_ptr) g_pinned_pool->return_buffer(pinned_ptr);
@@ -326,6 +597,10 @@ bool transfer_async_put_ext(int job_id,
 
                 // Stage 3: Write to disk (this is now the only blocking operation)
                 bool ok = flush_one_to_disk_fast(target, host_buf);
+<<<<<<< Updated upstream
+=======
+                // std::cout << "[DEBUG] Finished writing " << target << " to disk\n";
+>>>>>>> Stashed changes
                 // Return pinned memory to pool if used
                 if (host_buf.is_pinned()) {
                     g_pinned_pool->return_buffer(host_buf.data_ptr());
@@ -462,13 +737,12 @@ void swap_blocks_multi_layer(
   cudaStreamSynchronize(stream);
 }
 
-
 torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     if (!g_pinned_pool) {
         throw std::runtime_error("Pinned memory pool not initialized. Call init_performance_resources first.");
     }
 
-    // Open file
+    // Open file first to check validity before getting buffer
     std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
     if (!ifs) {
         throw std::runtime_error("Failed to open file: " + path);
@@ -479,13 +753,30 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     ifs.seekg(0, std::ios::beg);
 
     // Get pinned buffer from pool
-    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer();
+    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer(std::chrono::milliseconds(500));
     if (!pinned_ptr || pinned_size < file_size) {
         throw std::runtime_error("Pinned buffer too small for file: " + path);
     }
 
+    // RAII guard to ensure buffer is returned on any exception
+    struct PinnedBufferGuard {
+        void* ptr;
+        bool released = false;
+
+        PinnedBufferGuard(void* p) : ptr(p) {}
+        ~PinnedBufferGuard() {
+            if (!released && ptr) {
+                g_pinned_pool->return_buffer(ptr);
+            }
+        }
+        void release() { released = true; }
+    } guard(pinned_ptr);
+
     // Read into pinned memory
     ifs.read(reinterpret_cast<char*>(pinned_ptr), file_size);
+    if (!ifs) {
+        throw std::runtime_error("Failed to read from file: " + path);
+    }
     ifs.close();
 
     // Wrap pinned buffer into a Torch tensor (CPU, pinned)
@@ -504,6 +795,9 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
         },
         options
     );
+
+    // Release guard since tensor now owns the cleanup responsibility
+    guard.release();
 
     return tensor;
 }
@@ -665,6 +959,7 @@ bool transfer_async_get_ext(
             try {
                 // Stage 1: Read file into pinned CPU tensor
                 auto host_buf = read_file_to_pinned_tensor(src_file);
+<<<<<<< Updated upstream
                 // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
                 bool ok = copy_and_swap_gpu_tensors_ext(
                     host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
@@ -675,6 +970,17 @@ bool transfer_async_get_ext(
                 if (host_buf.is_pinned()) {
                     g_pinned_pool->return_buffer(host_buf.data_ptr());
                 }
+=======
+                // std::cout << "[DEBUG] Read file " << src_file << " into pinned tensor of size \n";
+                // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
+                bool ok = copy_and_swap_gpu_tensors_ext(
+                    host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
+                // std::cout << "[DEBUG] Launched copy_and_swap for " << src_file << "\n";
+                // Stage 3: Synchronize the stream to ensure copy finished
+                cudaStreamSynchronize(thread_stream->stream());
+
+                // std::cout << "[DEBUG] Finished copy_and_swap for " << src_file << "\n";
+>>>>>>> Stashed changes
                 at::cuda::setCurrentCUDAStream(current_stream);
 
                 job_state->completed_tasks.fetch_add(1);
