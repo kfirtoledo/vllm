@@ -62,7 +62,7 @@ class StorageOffloadingHandler(OffloadingHandler):
         os.makedirs(full_path.parent, exist_ok=True)
         return full_path
 
-    def compute_pinned_mb(self,dst_tensors, gpu_blocks_per_file, safety=1.0, min_mb=64, max_mb=None):
+    def compute_pinned_mb(self,dst_tensors, gpu_blocks_per_file, safety=1.0, min_mb=32, max_mb=None):
         """Estimate pinned memory size (in MB) needed for transfers."""
         ref = dst_tensors[0]
         block_elems = ref[:, 0].numel()                                  # (2, H, B, D)
@@ -103,7 +103,13 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             max_pinned_memory_gb=self.max_pinned_memory_gb,  # TODO: separate pools for PUT/GET
         )
 
-        logger.info(f"GPUStorageOffloadingHandler: max_concurrency={self.max_concurrency} pinned_buffer_size_mb={self.buffer_size_mb}")
+        logger.info(
+            f"GPUStorageOffloadingHandler: "
+            f"max_concurrency={self.max_concurrency}, "
+            f"pinned_buffer_size_mb={self.buffer_size_mb}, "
+            f"max_pinned_memory_gb={self.max_pinned_memory_gb}, "
+            f"root_dir={self.base_path}"
+        )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         """Launch async PUT transfers from GPU tensors to files.
