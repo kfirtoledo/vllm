@@ -23,53 +23,37 @@
 
 namespace py = pybind11;
 
-// -------------------------------
-// PinnedMemoryPool for buffers
-// -------------------------------
-struct PinnedMemoryPool {
-    std::vector<void*> buffers;
-    std::vector<size_t> buffer_sizes;
-    std::queue<size_t> available_buffers;
-    std::mutex pool_mutex;
+// -------------------------------------
+// Thread-local pinned buffer
+// -------------------------------------
+static thread_local void* t_pinned_ptr = nullptr;
+static thread_local size_t t_pinned_size = 0;
 
-    PinnedMemoryPool(size_t num_buffers, size_t buffer_size) {
-        buffers.reserve(num_buffers);
-        buffer_sizes.reserve(num_buffers);
+static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
+    if (!t_pinned_ptr || t_pinned_size < required_bytes) {
+        if (t_pinned_ptr) {
+            cudaFreeHost(t_pinned_ptr);
+            t_pinned_ptr = nullptr;
+            t_pinned_size = 0;
+        }
 
-        for (size_t i = 0; i < num_buffers; ++i) {
-            void* ptr;
-            cudaMallocHost(&ptr, buffer_size);
-            buffers.push_back(ptr);
-            buffer_sizes.push_back(buffer_size);
-            available_buffers.push(i);
+        size_t alloc_size = std::max(required_bytes, (size_t)16 * 1024 * 1024); // at least 16 MB
+        cudaError_t err = cudaMallocHost(&t_pinned_ptr, alloc_size);
+        if (err != cudaSuccess) {
+            std::cerr << "[ERROR] cudaMallocHost failed: "
+                      << cudaGetErrorString(err) << "\n";
+            t_pinned_ptr = nullptr;
+            t_pinned_size = 0;
+        } else {
+            t_pinned_size = alloc_size;
+            std::cout << "[INFO] Thread " << std::this_thread::get_id()
+                      << " allocated pinned buffer "
+                      << (alloc_size / (1024 * 1024)) << " MB\n";
         }
     }
+    return {t_pinned_ptr, t_pinned_size};
+}
 
-    ~PinnedMemoryPool() {
-        for (void* ptr : buffers) {
-            cudaFreeHost(ptr);
-        }
-    }
-
-    std::pair<void*, size_t> get_buffer() {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        if (available_buffers.empty()) return {nullptr, 0};
-
-        size_t idx = available_buffers.front();
-        available_buffers.pop();
-        return {buffers[idx], buffer_sizes[idx]};
-    }
-
-    void return_buffer(void* ptr) {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        for (size_t i = 0; i < buffers.size(); ++i) {
-            if (buffers[i] == ptr) {
-                available_buffers.push(i);
-                break;
-            }
-        }
-    }
-};
 
 // Tracks async job progress and results
 struct JobState {
@@ -87,8 +71,6 @@ struct JobState {
 // --------------------------------------
 // CUDA streams assigned to each worker thread
 static std::vector<at::cuda::CUDAStream> g_streams;
-// Global pinned memory pool for buffer reuse
-static std::unique_ptr<PinnedMemoryPool> g_pinned_pool;
 
 // Thread-local CUDA stream used by the current worker
 static thread_local std::optional<c10::cuda::CUDAStream> thread_stream;
@@ -112,12 +94,28 @@ private:
     std::atomic<bool> stop{false};
 
 public:
-    IOThreadPool(size_t threads) {
+    IOThreadPool(size_t threads, size_t pinned_buffer_mb = 16) {
+        // Initialize PyTorch threading globally (main thread only)
+        at::init_num_threads();
+        at::set_num_threads(1);
+
         for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this, i] {
+            workers.emplace_back([this, i, pinned_buffer_mb] {
+                // Each I/O thread preallocates its own pinned buffer
+                size_t alloc_bytes = pinned_buffer_mb * 1024 * 1024;
+                auto [ptr, size] = get_thread_local_pinned(alloc_bytes);
+
+                if (ptr) {
+                    std::cout << "[INFO] IO thread " << i
+                              << " preallocated pinned buffer "
+                              << (size / (1024 * 1024)) << " MB\n";
+                } else {
+                    std::cerr << "[WARN] IO thread " << i
+                              << " failed to allocate pinned buffer\n";
+                }
+
                 // Set thread affinity to prevent migration overhead
                 thread_stream_idx = i;
-
                 while (true) {
                     std::function<void()> task;
                     {
@@ -159,10 +157,9 @@ public:
         return res;
     }
 };
+
 // Global IO thread pool for scheduling async PUT/GET tasks
 static std::unique_ptr<IOThreadPool> g_io_pool;
-
-
 
 // -------------------------------
 // Initialize resources with pre-allocation
@@ -174,7 +171,13 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
         if (io_threads == 0) {
             io_threads = std::max(4u, std::thread::hardware_concurrency() / 2);
         }
-        g_io_pool = std::make_unique<IOThreadPool>(io_threads);
+        std::cout << "[INFO] Initializing IOThreadPool with "
+                  << io_threads << " threads, "
+                  << pinned_buffer_size_mb << " MB pinned buffer per thread, "
+                  << max_pinned_memory_gb << " GB max pinned memory\n"
+                  << std::thread::hardware_concurrency() << " hardware_concurrency\n";
+
+        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb);
 
         // Create dedicated streams for each thread
         g_streams.clear();
@@ -185,12 +188,11 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
 
         // Pre-allocate pinned memory pool
         size_t buffer_size = pinned_buffer_size_mb * 1024 * 1024;
-        size_t max_buffers = std::min(io_threads * 4, (max_pinned_memory_gb * 1024 * 1024 * 1024) / buffer_size);
-        g_pinned_pool = std::make_unique<PinnedMemoryPool>(max_buffers, buffer_size);
-        std::cout << "[INFO] Initializing pinned memory pool with "
-                  << max_buffers << " buffers of size "
-                  << pinned_buffer_size_mb << " MB each (total "
-                  << (max_buffers * pinned_buffer_size_mb) / 1024.0 << " GB)\n";
+        size_t max_buffers = std::min(io_threads, (max_pinned_memory_gb * 1024 * 1024 * 1024) / buffer_size);
+
+        if (max_buffers == 0) {
+           throw std::runtime_error("PinnedMemoryPool size is zero. Increase max_pinned_memory_gb or decrease pinned_buffer_size_mb.");
+        }
         // Warm up CUDA context and streams
         for (auto& stream : g_streams) {
             cudaStreamSynchronize(stream.stream());
@@ -219,8 +221,9 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
         }
     }
 
-    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer();
+
     size_t required_bytes = total_elements * element_size;
+    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(required_bytes);
 
     torch::Tensor result_cpu;
 
@@ -236,9 +239,10 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
             }
         }
 
+        // Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
         auto flat_gpu = torch::cat(blocks, 0);
 
-        // Create CPU tensor using pinned memory
+        // Create memory view of CPU tensor using pinned memory
         result_cpu = torch::from_blob(
             pinned_ptr,
             {static_cast<long>(total_elements)},
@@ -256,7 +260,6 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
 
     } else {
         // Fallback to regular memory
-        if (pinned_ptr) g_pinned_pool->return_buffer(pinned_ptr);
 
         std::vector<torch::Tensor> blocks;
         blocks.reserve(src_tensors.size() * block_ids_list.size());
@@ -289,10 +292,12 @@ std::vector<std::pair<int, bool>> get_finished_ext() {
     std::vector<std::pair<int, bool>> results;
     std::vector<int> to_erase;
 
+    // Iterate over all active jobs.
     for (auto &kv : jobs) {
         int job_id = kv.first;
         auto &job_state = kv.second;
 
+        // Check if the job has completed all its tasks.
         if (job_state->completed_tasks.load() == job_state->total_tasks.load()) {
             bool all_ok = job_state->all_success.load();
             results.emplace_back(job_id, all_ok);
@@ -300,6 +305,7 @@ std::vector<std::pair<int, bool>> get_finished_ext() {
         }
     }
 
+    // Remove all finished jobs from the map.
     for (int jid : to_erase) {
         jobs.erase(jid);
     }
@@ -310,7 +316,12 @@ std::vector<std::pair<int, bool>> get_finished_ext() {
 void cleanup_performance_resources() {
     g_io_pool.reset();
     g_streams.clear();
-    g_pinned_pool.reset();
+
+    if (t_pinned_ptr) {
+        cudaFreeHost(t_pinned_ptr);
+        t_pinned_ptr = nullptr;
+        t_pinned_size = 0;
+    }
 }
 
 //----------------------------------------------------------------------
@@ -339,7 +350,7 @@ bool flush_one_to_disk_fast(const std::string &target_path,
 
     ofs.write(reinterpret_cast<const char*>(data_ptr), nbytes);
     ofs.close();
-
+    // std::cout << "[INFO] Written " << nbytes << " bytes to temporary file: " << tmp_path << "\n";
     return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
 }
 
@@ -379,10 +390,12 @@ bool transfer_async_put_ext(int job_id,
 
                 // Stage 3: Write to disk (this is now the only blocking operation)
                 bool ok = flush_one_to_disk_fast(target, host_buf);
-                // Return pinned memory to pool if used
-                if (host_buf.is_pinned()) {
-                    g_pinned_pool->return_buffer(host_buf.data_ptr());
+                if (!ok) {
+                    std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
                 }
+                //  else {
+                //     std::cout << "[INFO] Put to file completed: " << target << "\n";
+                // }
 
                 at::cuda::setCurrentCUDAStream(current_stream);
 
@@ -490,13 +503,11 @@ void swap_blocks_multi_layer(
 
 // Read a file into a pinned CPU tensor from the pool
 torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
-    if (!g_pinned_pool) {
-        throw std::runtime_error("Pinned memory pool not initialized. Call init_performance_resources first.");
-    }
 
     // Open file
     std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
     if (!ifs) {
+        std::cerr << "[ERROR] Failed to open file: " << path << "\n";
         throw std::runtime_error("Failed to open file: " + path);
     }
 
@@ -505,15 +516,18 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     ifs.seekg(0, std::ios::beg);
 
     // Get pinned buffer from pool
-    auto [pinned_ptr, pinned_size] = g_pinned_pool->get_buffer();
+    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(file_size);
     if (!pinned_ptr || pinned_size < file_size) {
+        std::cerr << "[ERROR] Pinned buffer too small for file: " << path << "\n"
+                  << "[INFO] Required size: " << file_size << " bytes, Available size: " << pinned_size << " bytes\n"
+                  << "pinned_ptr: " << pinned_ptr << "\n";
         throw std::runtime_error("Pinned buffer too small for file: " + path);
     }
 
     // Read into pinned memory
     ifs.read(reinterpret_cast<char*>(pinned_ptr), file_size);
     ifs.close();
-
+    //std::cout << "[INFO] 1/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
     // Wrap pinned buffer into a Torch tensor (CPU, pinned)
     auto options = torch::TensorOptions()
         .dtype(torch::kUInt8)  // raw bytes
@@ -524,13 +538,10 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     auto tensor = torch::from_blob(
         pinned_ptr,
         {static_cast<long>(file_size)},
-        [pinned_ptr](void* /*unused*/) {
-            // Return buffer to pool instead of freeing
-            g_pinned_pool->return_buffer(pinned_ptr);
-        },
+        [pinned_ptr](void* /*unused*/) {},
         options
     );
-
+    // std::cout << "[INFO] 2/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
     return tensor;
 }
 
@@ -566,19 +577,17 @@ bool copy_and_swap_gpu_tensors_ext(
     int64_t num_bytes = buf.numel();
     int64_t num_elems = num_bytes / dst_tensors[0].element_size();
 
+    // Create a memory overview of CPU tensor over existing data_ptr.
     torch::Tensor flat_tensor = torch::from_blob(
         data_ptr,
         {num_elems},
         torch::TensorOptions().dtype(dst_tensors[0].dtype()).device(torch::kCPU)
-    ).clone();  // clone if buf’s lifetime is temporary
+    );
 
 
     int64_t numel = flat_tensor.numel();
     int64_t got_bytes = numel * flat_tensor.element_size();
     int64_t expected_bytes = expected_size * dst_tensors[0].element_size();
-
-    // std::cout << "[DEBUG] flat_tensor.numel(): " << numel
-    //         << " elems -> bytes: " << got_bytes << std::endl;
 
     if (numel != expected_size) {
         std::cerr << "[ERROR] File size mismatch: got " << numel
@@ -606,7 +615,6 @@ bool copy_and_swap_gpu_tensors_ext(
     }
 
     // 6. Offset calculation
-
     int offset = 0;
     int num_read_blocks = static_cast<int>(block_ids_list.size());
 
@@ -620,6 +628,7 @@ bool copy_and_swap_gpu_tensors_ext(
     TORCH_CHECK((num_blocks - offset) == (int)block_ids_list.size(),
                 "Mismatch: slice size != block_ids_list size");
 
+    // Build list of per-layer tensors, each shaped [2, num_blocks, H, B, D]
     std::vector<torch::Tensor> src_tensors;
     src_tensors.reserve(num_layers);
 
@@ -628,13 +637,13 @@ bool copy_and_swap_gpu_tensors_ext(
         blocks_for_layer.reserve(block_ids_list.size());
 
         for (int j = 0; j < (int)block_ids_list.size(); j++) {
-            int global_b = block_ids_list[j];   // global block id (e.g. 3,4,5…)
+            int global_b = block_ids_list[j];   // global block id
             int local_b  = global_b % num_blocks; // offset inside this file
 
-            auto block_tensor = torch_arr[local_b][i];  // shape [2,H,B,D]
+            auto block_tensor = torch_arr[local_b][i];  // one block for this layer [2, H, B, D]
             blocks_for_layer.push_back(block_tensor);
         }
-
+        // Stack all blocks along dim=1 → [2, num_blocks, H, B, D]
         auto layer_tensor = torch::stack(blocks_for_layer, 1).contiguous();
         src_tensors.push_back(layer_tensor);
     }
@@ -676,7 +685,6 @@ bool transfer_async_get_ext(
     for (size_t i = 0; i < source_files.size(); i++) {
         std::string src_file = source_files[i];
         auto block_ids = all_block_ids[i];
-
         auto future = g_io_pool->enqueue([=, job_state = job_state.get()]() -> bool {
 
             // Get dedicated stream for this thread
@@ -687,32 +695,53 @@ bool transfer_async_get_ext(
             auto current_stream = at::cuda::getCurrentCUDAStream();
             at::cuda::setCurrentCUDAStream(*thread_stream);
 
+            bool stage1_ok = false;
+            torch::Tensor host_buf;
+
+            // -------------------------
+            // Stage 1: File → pinned CPU
+            // -------------------------
             try {
-                // Stage 1: Read file into pinned CPU tensor
-                auto host_buf = read_file_to_pinned_tensor(src_file);
-                // Stage 2: Launch async CPU → GPU copy and swap into dst_tensors
-                bool ok = copy_and_swap_gpu_tensors_ext(
-                    host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
-                // Stage 3: Synchronize the stream to ensure copy finished
-                cudaStreamSynchronize(thread_stream->stream());
-
-                // Return pinned memory to pool if used
-                if (host_buf.is_pinned()) {
-                    g_pinned_pool->return_buffer(host_buf.data_ptr());
-                }
-                at::cuda::setCurrentCUDAStream(current_stream);
-
-                job_state->completed_tasks.fetch_add(1);
-                if (!ok) job_state->all_success = false;
-                return ok;
-
+                host_buf = read_file_to_pinned_tensor(src_file);
+                stage1_ok = true;
+            } catch (const std::exception& e) {
+                std::cerr << "[ERROR] Stage1 read_file_to_pinned_tensor failed for "
+                        << src_file << ": " << e.what() << std::endl;
             } catch (...) {
-                at::cuda::setCurrentCUDAStream(current_stream);
-                job_state->completed_tasks.fetch_add(1);
-                job_state->all_success = false;
-                std::cerr << "[WARNING] GET failed for " << src_file  << "\n";
-                return false;
+                std::cerr << "[ERROR] Stage1 unknown failure for " << src_file << std::endl;
             }
+
+            // -------------------------
+            // Stage 2: CPU → GPU copy
+            // -------------------------
+            bool ok = false;
+            if (stage1_ok) {
+                try {
+                    ok = copy_and_swap_gpu_tensors_ext(
+                        host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
+
+                    cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
+                    if (err != cudaSuccess) {
+                        std::cerr << "[ERROR] cudaStreamSynchronize failed: "
+                                << cudaGetErrorString(err) << std::endl;
+                        ok = false;
+                    }
+
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERROR] Stage2 copy_and_swap failed for " << src_file
+                            << ": " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[ERROR] Stage2 unknown failure for " << src_file << std::endl;
+                }
+            }
+
+            // -------------------------
+            // Final cleanup & accounting
+            // -------------------------
+            at::cuda::setCurrentCUDAStream(current_stream);
+            job_state->completed_tasks.fetch_add(1);
+            if (!ok) job_state->all_success = false;
+            return ok;
         });
 
         job_state->futures.push_back(future.share());
