@@ -95,7 +95,7 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
                    root_dir: str, num_layers: int, num_blocks: int,
                    block_size: int, num_heads: int, head_size: int,
                    read_block_ids: list[int], write_block_ids: list[int],
-                   group_size: int, max_concurrency: int):
+                   group_size: int, threads_per_gpu: int):
 
     original = create_dummy_kv_tensors(num_layers, num_blocks, block_size, num_heads, head_size, dtype)
     restored = [torch.zeros_like(t) for t in original]
@@ -113,7 +113,7 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
         src_tensors=original,
         gpu_blocks_per_file=group_size,
         dtype=dtype,
-        max_concurrency=max_concurrency,
+        threads_per_gpu=threads_per_gpu,
         root_dir=root_dir,
     )
     start_put = time.time()
@@ -132,7 +132,7 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
         dtype=dtype,
         gpu_blocks_per_file=group_size,
         dst_tensors=restored,
-        max_concurrency=max_concurrency,
+        threads_per_gpu=threads_per_gpu,
         root_dir=root_dir,
     )
     start_get = time.time()
@@ -177,7 +177,7 @@ def test_shared_storage_roundtrip_param(group_size: int, start_idx: int):
     num_blocks = 8
     write_block_ids = list(range(num_blocks))
     read_block_ids = list(range(start_idx, num_blocks))
-    max_concurrency = 2
+    threads_per_gpu = 8
     roundtrip_once(model_name=model_name, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, root_dir=root_dir, num_layers=num_layers,
                    num_blocks=num_blocks, block_size=block_size, num_heads=num_heads, head_size=head_size, read_block_ids=read_block_ids,
-                   write_block_ids=write_block_ids, group_size=group_size,max_concurrency=max_concurrency)
+                   write_block_ids=write_block_ids, group_size=group_size,threads_per_gpu=threads_per_gpu)

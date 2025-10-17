@@ -17,7 +17,7 @@ logger = init_logger(__name__)
 # Base Storage Offloading Handler
 # ----------------------------------------------------------------------
 DEFAULT_MAX_PINNED_MEMORY_GB = 100
-DEFAULT_MAX_CONCURRENCY = 16
+DEFAULT_MAX_THREADS_PER_GPU = 32
 
 class StorageOffloadingHandler(OffloadingHandler):
     """Base handler with common helpers for Storage offloading."""
@@ -28,7 +28,7 @@ class StorageOffloadingHandler(OffloadingHandler):
                  tp_rank: int,
                  dtype: torch.dtype,
                  gpu_blocks_per_file: int,
-                 max_concurrency: int = None,
+                 threads_per_gpu: int ,
                  max_pinned_memory_gb: int = DEFAULT_MAX_PINNED_MEMORY_GB,  # in GB
                  root_dir: str = "/tmp/shared-kv"):
         self.model_name = model_name
@@ -37,7 +37,7 @@ class StorageOffloadingHandler(OffloadingHandler):
         self.dtype = dtype
         self.gpu_blocks_per_file = gpu_blocks_per_file
         self.base_path = self.get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir)
-        self.max_concurrency = min(int(max_concurrency or (os.cpu_count())), DEFAULT_MAX_CONCURRENCY)
+        self.threads_per_gpu = min(threads_per_gpu , int(os.cpu_count()/tp_size), DEFAULT_MAX_THREADS_PER_GPU)
         self.max_pinned_memory_gb = max_pinned_memory_gb
         self.h2d_stream = torch.cuda.Stream()
         self.d2h_stream = torch.cuda.Stream()
@@ -88,24 +88,25 @@ class StorageOffloadingHandler(OffloadingHandler):
 class GPUStorageOffloadingHandler(StorageOffloadingHandler):
     """Handler for writing KV blocks from GPU tensors into shared storage."""
     def __init__(self, model_name, tp_size, tp_rank, src_tensors,
-                 gpu_blocks_per_file, dtype, max_concurrency=None,
+                 gpu_blocks_per_file, dtype, threads_per_gpu=None,
                  max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
         super().__init__(model_name, tp_size, tp_rank, dtype,
-                         gpu_blocks_per_file, max_concurrency, max_pinned_memory_gb, root_dir)
+                         gpu_blocks_per_file, threads_per_gpu, max_pinned_memory_gb, root_dir)
 
         self.src_tensors = src_tensors
         self.buffer_size_mb = self.compute_pinned_mb(src_tensors, gpu_blocks_per_file)
 
         # TODO set different init for each class
         storage_offload_ext.init_performance_resources(
-            io_threads=self.max_concurrency,
+            io_threads=self.threads_per_gpu,
             pinned_buffer_size_mb=self.buffer_size_mb,
             max_pinned_memory_gb=self.max_pinned_memory_gb,  # TODO: separate pools for PUT/GET
         )
 
         logger.info(
             f"GPUStorageOffloadingHandler: "
-            f"max_concurrency={self.max_concurrency}, "
+            f"number_of_gpu={self.tp_size},"
+            f"threads_per_gpu={self.threads_per_gpu},"
             f"pinned_buffer_size_mb={self.buffer_size_mb}, "
             f"max_pinned_memory_gb={self.max_pinned_memory_gb}, "
             f"root_dir={self.base_path}"
@@ -147,9 +148,9 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
 
     def __init__(self, model_name, tp_size, tp_rank, dtype,
                  gpu_blocks_per_file, dst_tensors,
-                 max_concurrency=None, max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
+                 threads_per_gpu=None, max_pinned_memory_gb = DEFAULT_MAX_PINNED_MEMORY_GB, root_dir="/tmp/shared-kv"):
         super().__init__(model_name, tp_size, tp_rank, dtype,
-                         gpu_blocks_per_file, max_concurrency, max_pinned_memory_gb, root_dir)
+                         gpu_blocks_per_file, threads_per_gpu, max_pinned_memory_gb, root_dir)
         self.dst_tensors = dst_tensors
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
