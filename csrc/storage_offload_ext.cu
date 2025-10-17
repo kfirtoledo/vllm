@@ -82,6 +82,31 @@ static std::mutex jobs_mutex;
 // Global map of job_id → JobState, tracking async job progress
 static std::map<int, std::unique_ptr<JobState>> jobs;
 
+struct PinnedBufferInfo {
+    void* ptr = nullptr;
+    size_t size = 0;
+};
+
+static std::vector<PinnedBufferInfo> g_pinned_buffers;
+void preallocate_pinned_buffers(size_t io_threads, size_t pinned_buffer_size_mb) {
+    g_pinned_buffers.resize(io_threads);
+    size_t alloc_bytes = pinned_buffer_size_mb * 1024 * 1024;
+
+    for (size_t i = 0; i < io_threads; ++i) {
+        void* ptr = nullptr;
+        cudaError_t err = cudaMallocHost(&ptr, alloc_bytes);
+        if (err != cudaSuccess) {
+            std::cerr << "[ERROR] Failed to allocate pinned buffer for thread "
+                      << i << ": " << cudaGetErrorString(err) << std::endl;
+            g_pinned_buffers[i] = {nullptr, 0};
+        } else {
+            g_pinned_buffers[i] = {ptr, alloc_bytes};
+            std::cout << "[INFO] Pre-allocated pinned buffer "
+                      << (alloc_bytes / (1024 * 1024))
+                      << " MB for thread " << i << std::endl;
+        }
+    }
+}
 // -------------------------------
 // I/O thread pool for scheduling
 // -------------------------------
@@ -101,20 +126,17 @@ public:
 
         for (size_t i = 0; i < threads; ++i) {
             workers.emplace_back([this, i, pinned_buffer_mb] {
-                // Each I/O thread preallocates its own pinned buffer
-                size_t alloc_bytes = pinned_buffer_mb * 1024 * 1024;
-                auto [ptr, size] = get_thread_local_pinned(alloc_bytes);
-
-                if (ptr) {
+                if (i < g_pinned_buffers.size() && g_pinned_buffers[i].ptr != nullptr) {
+                    t_pinned_ptr = g_pinned_buffers[i].ptr;
+                    t_pinned_size = g_pinned_buffers[i].size;
                     std::cout << "[INFO] IO thread " << i
-                              << " preallocated pinned buffer "
-                              << (size / (1024 * 1024)) << " MB\n";
+                            << " attached to preallocated pinned buffer "
+                            << (t_pinned_size / (1024 * 1024)) << " MB\n";
                 } else {
                     std::cerr << "[WARN] IO thread " << i
-                              << " failed to allocate pinned buffer\n";
+                            << " has no preallocated pinned buffer\n";
                 }
 
-                // Set thread affinity to prevent migration overhead
                 thread_stream_idx = i;
                 while (true) {
                     std::function<void()> task;
@@ -177,8 +199,10 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
                   << max_pinned_memory_gb << " GB max pinned memory\n"
                   << std::thread::hardware_concurrency() << " hardware_concurrency\n";
 
-        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb);
+        // Pre-allocate pinned buffers before launching threads
+        preallocate_pinned_buffers(io_threads, pinned_buffer_size_mb);
 
+        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb);
         // Create dedicated streams for each thread
         g_streams.clear();
         g_streams.reserve(io_threads);

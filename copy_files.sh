@@ -7,7 +7,7 @@ REMOTE_BASE="/workspace/vllm"
 FILES=(
 
   #Shared storage files
-  "vllm/v1/offloading/worker/shared_storage.py"
+  #"vllm/v1/offloading/worker/shared_storage.py"
   #"vllm/v1/offloading/shared_storage.py"
   #"tests/v1/offloading/test_shared_storage.py"
   # "vllm/v1/offloading/shared_storage_manager.py"
