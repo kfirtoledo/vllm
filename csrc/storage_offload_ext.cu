@@ -210,13 +210,6 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
             g_streams.push_back(at::cuda::getStreamFromPool(/*isHighPriority=*/false));
         }
 
-        // Pre-allocate pinned memory pool
-        size_t buffer_size = pinned_buffer_size_mb * 1024 * 1024;
-        size_t max_buffers = std::min(io_threads, (max_pinned_memory_gb * 1024 * 1024 * 1024) / buffer_size);
-
-        if (max_buffers == 0) {
-           throw std::runtime_error("PinnedMemoryPool size is zero. Increase max_pinned_memory_gb or decrease pinned_buffer_size_mb.");
-        }
         // Warm up CUDA context and streams
         for (auto& stream : g_streams) {
             cudaStreamSynchronize(stream.stream());
@@ -224,87 +217,6 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
     }
 }
 
-// -------------------------------
-// Optimized GPU → CPU copy with zero-copy when possible
-// -------------------------------
-// Copy selected GPU tensor blocks into pinned CPU buffer asynchronously
-torch::Tensor copy_gpu_tensors_to_buffer_async(
-    const std::vector<torch::Tensor>& src_tensors,
-    const std::vector<int64_t>& block_ids_list,
-    const c10::cuda::CUDAStream& stream) {
-
-    // Calculate total size first
-    size_t total_elements = 0;
-    auto dtype = src_tensors[0].dtype();
-    size_t element_size = src_tensors[0].element_size();
-
-    for (int64_t block_id : block_ids_list) {
-        for (const auto &tensor : src_tensors) {
-            auto block = tensor.index({torch::indexing::Slice(), block_id});
-            total_elements += block.numel();
-        }
-    }
-
-
-    size_t required_bytes = total_elements * element_size;
-    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(required_bytes);
-
-    torch::Tensor result_cpu;
-
-    if (pinned_ptr && pinned_size >= required_bytes) {
-        // Use pinned memory - much faster transfer
-        std::vector<torch::Tensor> blocks;
-        blocks.reserve(src_tensors.size() * block_ids_list.size());
-
-        for (int64_t block_id : block_ids_list) {
-            for (const auto &tensor : src_tensors) {
-                auto block = tensor.index({torch::indexing::Slice(), block_id});
-                blocks.push_back(block.contiguous());
-            }
-        }
-
-        // Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
-        auto flat_gpu = torch::cat(blocks, 0);
-
-        // Create memory view of CPU tensor using pinned memory
-        result_cpu = torch::from_blob(
-            pinned_ptr,
-            {static_cast<long>(total_elements)},
-            torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true)
-        );
-
-        // Async copy GPU -> pinned CPU memory
-        cudaMemcpyAsync(
-            pinned_ptr,
-            flat_gpu.data_ptr(),
-            required_bytes,
-            cudaMemcpyDeviceToHost,
-            stream.stream()
-        );
-
-    } else {
-        // Fallback to regular memory
-
-        std::vector<torch::Tensor> blocks;
-        blocks.reserve(src_tensors.size() * block_ids_list.size());
-
-        for (int64_t block_id : block_ids_list) {
-            for (const auto &tensor : src_tensors) {
-                auto block = tensor.index({torch::indexing::Slice(), block_id});
-                blocks.push_back(block);
-            }
-        }
-
-        auto flat = torch::cat(blocks, 0);
-        result_cpu = flat.contiguous().to(torch::kCPU, /*non_blocking=*/true);
-    }
-
-    if (result_cpu.dtype() == torch::kBFloat16) {
-        result_cpu = result_cpu.view(torch::kUInt16);
-    }
-
-    return result_cpu;
-}
 
 // -------------------------------
 // Status and cleanup
@@ -336,7 +248,7 @@ std::vector<std::pair<int, bool>> get_finished_ext() {
     return results;
 }
 
-// Release IO threads, CUDA streams, and pinned pool
+// Release IO threads, CUDA streams, and pinned buffer
 void cleanup_performance_resources() {
     g_io_pool.reset();
     g_streams.clear();
@@ -351,16 +263,78 @@ void cleanup_performance_resources() {
 //----------------------------------------------------------------------
 // GPU → Storage (PUT)
 // ----------------------------------------------------------------------
+// Copy selected GPU tensor blocks into pinned CPU buffer asynchronously
+torch::Tensor copy_gpu_tensors_to_buffer_async(
+    const std::vector<torch::Tensor>& src_tensors,
+    const std::vector<int64_t>& block_ids_list,
+    const c10::cuda::CUDAStream& stream) {
+
+    // Calculate total size first
+    size_t total_elements = 0;
+    auto dtype = src_tensors[0].dtype();
+    size_t element_size = src_tensors[0].element_size();
+
+    for (int64_t block_id : block_ids_list) {
+        for (const auto &tensor : src_tensors) {
+            auto block = tensor.index({torch::indexing::Slice(), block_id});
+            total_elements += block.numel();
+        }
+    }
+
+    size_t required_bytes = total_elements * element_size;
+    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(required_bytes);
+
+    torch::Tensor result_cpu;
+
+    // Use pinned memory - much faster transfer
+    std::vector<torch::Tensor> blocks;
+    blocks.reserve(src_tensors.size() * block_ids_list.size());
+
+    for (int64_t block_id : block_ids_list) {
+        for (const auto &tensor : src_tensors) {
+            auto block = tensor.index({torch::indexing::Slice(), block_id});
+            blocks.push_back(block.contiguous());
+        }
+    }
+
+    // Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
+    auto flat_gpu = torch::cat(blocks, 0);
+
+    // Create memory view of CPU tensor using pinned memory
+    result_cpu = torch::from_blob(
+        pinned_ptr,
+        {static_cast<long>(total_elements)},
+        torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true)
+    );
+
+    // Async copy GPU -> pinned CPU memory
+    cudaMemcpyAsync(
+        pinned_ptr,
+        flat_gpu.data_ptr(),
+        required_bytes,
+        cudaMemcpyDeviceToHost,
+        stream.stream()
+    );
+
+    if (result_cpu.dtype() == torch::kBFloat16) {
+        result_cpu = result_cpu.view(torch::kUInt16);
+    }
+
+    return result_cpu;
+}
+
 
 // File write helpers - optimized for large writes
 bool flush_one_to_disk_fast(const std::string &target_path,
                             const torch::Tensor &host_buf) {
     const void* data_ptr = host_buf.data_ptr();
+    // Get total number of bytes to write
     size_t nbytes = host_buf.nbytes();
+    // Write first to a temporary file to ensure atomic rename later
     std::string tmp_path = target_path + ".tmp";
 
-    // Use larger buffer for faster I/O
-    const size_t WRITE_BUFFER_SIZE = 1024 * 1024; // 1MB buffer
+    // Define a larger buffer (1MB) to reduce syscall overhead and speed up I/O
+    const size_t WRITE_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB buffer
 
     std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
     if (!ofs) {
@@ -368,13 +342,15 @@ bool flush_one_to_disk_fast(const std::string &target_path,
         return false;
     }
 
-    // Set larger buffer
+    // Allocate custom I/O buffer for this stream (replaces small default buffer)
     std::vector<char> buffer(WRITE_BUFFER_SIZE);
+    // Apply the custom buffer to the file stream
     ofs.rdbuf()->pubsetbuf(buffer.data(), WRITE_BUFFER_SIZE);
 
     ofs.write(reinterpret_cast<const char*>(data_ptr), nbytes);
     ofs.close();
     // std::cout << "[INFO] Written " << nbytes << " bytes to temporary file: " << tmp_path << "\n";
+    // Atomically rename temp file to final target name after successful write
     return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
 }
 
@@ -384,12 +360,12 @@ bool transfer_async_put_ext(int job_id,
                         std::vector<std::string> target_files,
                         std::vector<torch::Tensor> src_tensors,
                         std::vector<std::vector<int64_t>> all_block_ids) {
-    init_performance_resources();
 
-    std::lock_guard<std::mutex> lock(jobs_mutex);
+    // Create job state object that will track progress and futures for this job.
     auto job_state = std::make_unique<JobState>();
     job_state->total_tasks = target_files.size();
 
+    // For each target file, enqueue one async task in the I/O thread pool.
     for (size_t i = 0; i < target_files.size(); i++) {
         std::string target = target_files[i];
         auto src = src_tensors;
@@ -397,32 +373,31 @@ bool transfer_async_put_ext(int job_id,
 
         auto future = g_io_pool->enqueue([=, job_state = job_state.get()]() -> bool {
 
-            // Get dedicated stream for this thread
+          // Each thread gets a dedicated CUDA stream for async GPU ops.
             if (!thread_stream.has_value()) {
                 thread_stream = g_streams[thread_stream_idx % g_streams.size()];
             }
 
+            // Save current CUDA stream so we can restore it later.
             auto current_stream = at::cuda::getCurrentCUDAStream();
             at::cuda::setCurrentCUDAStream(*thread_stream);
 
             try {
-                // Stage 1: Start async GPU → CPU copy (non-blocking)
+                // Stage 1: Asynchronously copy tensors from GPU to pinned CPU buffer.
                 auto host_buf = copy_gpu_tensors_to_buffer_async(src, bids, *thread_stream);
 
-                // Stage 2: Only synchronize the specific stream we need
+                // Stage 2: Synchronize only this thread's CUDA stream (not all).
                 cudaStreamSynchronize(thread_stream->stream());
 
-                // Stage 3: Write to disk (this is now the only blocking operation)
+                // Stage 3: Write the pinned buffer to disk (blocking operation).
                 bool ok = flush_one_to_disk_fast(target, host_buf);
-                if (!ok) {
+                if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
-                }
-                //  else {
-                //     std::cout << "[INFO] Put to file completed: " << target << "\n";
-                // }
 
+                // Restore original CUDA stream for safety.
                 at::cuda::setCurrentCUDAStream(current_stream);
 
+                // Atomically mark task completion.
                 job_state->completed_tasks.fetch_add(1);
                 if (!ok) job_state->all_success = false;
                 return ok;
@@ -436,15 +411,15 @@ bool transfer_async_put_ext(int job_id,
             }
         });
 
+        // Convert std::future → std::shared_future- is copyable and can be waited on by multiple threads.
         job_state->futures.push_back(future.share());
     }
 
+    std::lock_guard<std::mutex> lock(jobs_mutex); // protect jobs map
     jobs[job_id] = std::move(job_state);
+
     return true;
 }
-
-
-
 // ----------------------------------------------------------------------
 // Storage -> GPU (GET)
 // ----------------------------------------------------------------------
@@ -576,39 +551,34 @@ bool copy_and_swap_gpu_tensors_ext(
     const std::vector<torch::Tensor>& dst_tensors,
     int gpu_blocks_per_file) {
 
-    // 1. Shape of one KV block [2, H, B, D]
+    // 1. Extract the shape of one KV block [2, H, B, D] from first destination tensor
     auto sliced = dst_tensors[0].index({torch::indexing::Slice(), 0});
     auto block_shape = sliced.sizes();  // (2, B, D)
 
+    // 2. Compute total elements per block
     int64_t elems_per_block = 1;
     for (auto s : block_shape) elems_per_block *= s;
-
     int num_layers = dst_tensors.size();
-
     int num_blocks = gpu_blocks_per_file;
-
     int64_t expected_size = elems_per_block * num_layers * num_blocks;
     // std::cout << "[DEBUG] expected_size (elements): " << expected_size
     //           << " -> bytes: " << expected_size * dst_tensors[0].element_size() << std::endl;
 
-    // 2. Reinterpret raw buffer
-    auto dtype = dst_tensors[0].dtype();
-    auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
 
-    // 3. Sanity check
-    bool full_block = (block_ids_list.size() % gpu_blocks_per_file == 0);
+
+    // 3. Create a memory overview of CPU tensor over existing data_ptr.
     auto data_ptr = buf.data_ptr<uint8_t>();
     int64_t num_bytes = buf.numel();
     int64_t num_elems = num_bytes / dst_tensors[0].element_size();
-
-    // Create a memory overview of CPU tensor over existing data_ptr.
+    auto dtype = dst_tensors[0].dtype();
+    auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
     torch::Tensor flat_tensor = torch::from_blob(
         data_ptr,
         {num_elems},
         torch::TensorOptions().dtype(dst_tensors[0].dtype()).device(torch::kCPU)
     );
 
-
+    // 4. Validate file size
     int64_t numel = flat_tensor.numel();
     int64_t got_bytes = numel * flat_tensor.element_size();
     int64_t expected_bytes = expected_size * dst_tensors[0].element_size();
@@ -623,17 +593,14 @@ bool copy_and_swap_gpu_tensors_ext(
             std::to_string(expected_size) + " elems (" +
             std::to_string(expected_bytes) + " bytes)");
     }
-    // 4. Reshape into [num_blocks, num_layers, 2, H, B, D]
-    // Expect [num_blocks, num_layers, 2, B, D]
+
+    // 5. Reshape flat buffer into 6D tensor [num_blocks, num_layers, 2, H, B, D]
     std::vector<int64_t> new_shape = {num_blocks, num_layers};
     new_shape.insert(new_shape.end(), block_shape.begin(), block_shape.end());
-    // block_shape = (2, 64, 16, 128) -> [2, 64, 16, 128]
-    // new_shape = [1, 80, 2, 64, 16, 128]
-
     auto torch_arr = flat_tensor.view(new_shape);
     // std::cout << "[DEBUG] torch_arr reshaped to: " << torch_arr.sizes() << std::endl;
 
-    // 5. Handle bf16 special case
+    // Handle bf16 special case
     if (dst_tensors[0].dtype() == torch::kBFloat16 && torch_arr.dtype() != torch::kBFloat16) {
         torch_arr = torch_arr.view(torch::kBFloat16);
     }
@@ -641,11 +608,10 @@ bool copy_and_swap_gpu_tensors_ext(
     // 6. Offset calculation
     int offset = 0;
     int num_read_blocks = static_cast<int>(block_ids_list.size());
-
+    bool full_block = (block_ids_list.size() % gpu_blocks_per_file == 0);
     if (!full_block) {
         offset = num_blocks - block_ids_list.size();
     }
-
 
     // 7. Build src_tensors for each layer
     // Assert that slice length matches block_ids_list
@@ -672,7 +638,6 @@ bool copy_and_swap_gpu_tensors_ext(
         src_tensors.push_back(layer_tensor);
     }
 
-
     // 8. Build mapping tensor (src index → dst block_id)
     std::vector<int64_t> mapping_vec;
     mapping_vec.reserve(num_read_blocks * 2);
@@ -680,13 +645,15 @@ bool copy_and_swap_gpu_tensors_ext(
         mapping_vec.push_back(i);                   // src index in stacked tensor
         mapping_vec.push_back(block_ids_list[i]);   // target block_id
     }
+
+    // Convert mapping vector into CPU tensor [num_read_blocks, 2]
     auto src_to_dst = torch::from_blob(
         mapping_vec.data(),
         {(int64_t)num_read_blocks, 2},
         torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)
     ).clone();
 
-    // 9. Call backend directly
+    // 9. Call backend to swap GPU blocks
     swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst);
 
     return true;
@@ -700,12 +667,11 @@ bool transfer_async_get_ext(
     std::vector<torch::Tensor> dst_tensors,
     int gpu_blocks_per_file)
 {
-    init_performance_resources();
-
-    std::lock_guard<std::mutex> lock(jobs_mutex);
+    // Create job state object to track progress and futures for this job.
     auto job_state = std::make_unique<JobState>();
     job_state->total_tasks = source_files.size();
 
+    // For each source file, enqueue one async task in the I/O thread pool.
     for (size_t i = 0; i < source_files.size(); i++) {
         std::string src_file = source_files[i];
         auto block_ids = all_block_ids[i];
@@ -716,16 +682,17 @@ bool transfer_async_get_ext(
                 thread_stream = g_streams[thread_stream_idx % g_streams.size()];
             }
 
+            // Save current CUDA stream so we can restore it later.
             auto current_stream = at::cuda::getCurrentCUDAStream();
             at::cuda::setCurrentCUDAStream(*thread_stream);
-
-            bool stage1_ok = false;
-            torch::Tensor host_buf;
 
             // -------------------------
             // Stage 1: File → pinned CPU
             // -------------------------
+            bool stage1_ok = false;
+            torch::Tensor host_buf;
             try {
+                // Read data from disk into pinned memory tensor.
                 host_buf = read_file_to_pinned_tensor(src_file);
                 stage1_ok = true;
             } catch (const std::exception& e) {
@@ -741,6 +708,7 @@ bool transfer_async_get_ext(
             bool ok = false;
             if (stage1_ok) {
                 try {
+                    // Perform asynchronous GPU copy and tensor swap.
                     ok = copy_and_swap_gpu_tensors_ext(
                         host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
 
@@ -762,15 +730,18 @@ bool transfer_async_get_ext(
             // -------------------------
             // Final cleanup & accounting
             // -------------------------
+            // Synchronize only this thread's CUDA stream.
             at::cuda::setCurrentCUDAStream(current_stream);
             job_state->completed_tasks.fetch_add(1);
             if (!ok) job_state->all_success = false;
             return ok;
         });
+        // Convert std::future → std::shared_future- is copyable and can be waited on by multiple threads.
 
         job_state->futures.push_back(future.share());
     }
 
+    std::lock_guard<std::mutex> lock(jobs_mutex);
     jobs[job_id] = std::move(job_state);
     return true;
 }
@@ -783,7 +754,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("io_threads") = 0,
           py::arg("pinned_buffer_size_mb") = 256,
           py::arg("max_pinned_memory_gb") = 50);
+
     m.def("cleanup_performance_resources", &cleanup_performance_resources);
+
     m.def("get_finished_ext", &get_finished_ext);
 
     m.def("transfer_async_put_ext", &transfer_async_put_ext,
@@ -800,5 +773,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("all_block_ids"),
       py::arg("dst_tensors"),
       py::arg("gpu_blocks_per_file"));
-    m.def("swap_blocks_multi_layer", &swap_blocks_multi_layer);
 }
