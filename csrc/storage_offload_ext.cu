@@ -423,82 +423,6 @@ bool transfer_async_put_ext(int job_id,
 // ----------------------------------------------------------------------
 // Storage -> GPU (GET)
 // ----------------------------------------------------------------------
-// Swap KV blocks between source and destination tensors (multi-layer)
-void swap_blocks_multi_layer(
-    const std::vector<torch::Tensor>& src_kv_caches,
-    const std::vector<torch::Tensor>& dst_kv_caches,
-    const torch::Tensor& block_mapping) {
-
-  TORCH_CHECK(src_kv_caches.size() == dst_kv_caches.size(),
-              "src and dst must have the same number of layers");
-  TORCH_CHECK(block_mapping.device().is_cpu(),
-              "block_mapping must be on CPU");
-
-  // Assume all tensors are on same device
-  torch::Device src_device = src_kv_caches[0].device();
-  torch::Device dst_device = dst_kv_caches[0].device();
-
-  cudaMemcpyKind memcpy_type;
-  if (src_device.is_cuda() && dst_device.is_cuda()) {
-    TORCH_CHECK(src_device.index() == dst_device.index(),
-                "src and dst must be on the same GPU");
-    memcpy_type = cudaMemcpyDeviceToDevice;
-  } else if (src_device.is_cuda() && dst_device.is_cpu()) {
-    memcpy_type = cudaMemcpyDeviceToHost;
-  } else if (src_device.is_cpu() && dst_device.is_cuda()) {
-    memcpy_type = cudaMemcpyHostToDevice;
-  } else {
-    TORCH_CHECK(false, "Invalid device combination");
-  }
-
-  const int64_t num_blocks = block_mapping.size(0);
-  const at::cuda::OptionalCUDAGuard device_guard(
-      src_device.is_cuda() ? src_device : dst_device);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-  // Loop over layers
-  for (size_t layer = 0; layer < src_kv_caches.size(); ++layer) {
-    auto src = src_kv_caches[layer];
-    auto dst = dst_kv_caches[layer];
-
-    TORCH_CHECK(src.dim() >= 2 && dst.dim() >= 2,
-                "Expected each KV cache tensor to have at least 2 dims "
-                "(kv, blocks, ...)");
-    TORCH_CHECK(src.size(0) == 2 && dst.size(0) == 2,
-                "First dimension must be size=2 (key, value)");
-
-    // For both key/value (dim 0 split)
-    for (int kv = 0; kv < 2; ++kv) {
-      auto src_view = src.select(0, kv);
-      auto dst_view = dst.select(0, kv);
-
-      char* src_ptr = static_cast<char*>(src_view.data_ptr());
-      char* dst_ptr = static_cast<char*>(dst_view.data_ptr());
-
-      // Size per "block" in bytes.
-      // We assume blocks are indexed along dim=0 of src_view.
-      int64_t block_size_in_bytes =
-        src_view.element_size() * src_view.stride(0);
-
-      for (int64_t i = 0; i < num_blocks; i++) {
-        int64_t src_block_number = block_mapping[i][0].item<int64_t>();
-        int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
-        int64_t src_offset = src_block_number * block_size_in_bytes;
-        int64_t dst_offset = dst_block_number * block_size_in_bytes;
-
-        cudaMemcpyAsync(dst_ptr + dst_offset,
-                        src_ptr + src_offset,
-                        block_size_in_bytes,
-                        memcpy_type,
-                        stream);
-      }
-    }
-  }
-
-  // Synchronize once after all copies queued
-  cudaStreamSynchronize(stream);
-}
-
 
 // Read a file into a pinned CPU tensor from the pool
 torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
@@ -544,117 +468,84 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     return tensor;
 }
 
-// Copy buffer to GPU tensors and swap blocks into place
+// Copy buffer to GPU tensors asynchronously using cudaMemcpyAsync (no swap_blocks)
+// CPU layout (contiguous): [num_blocks_in_file, num_layers, 2, H, B, D]
+// GPU layout (contiguous): [2, num_blocks_total, H, B, D]
 bool copy_and_swap_gpu_tensors_ext(
-    torch::Tensor buf,                           // raw CPU buffer (uint8 tensor from mmap or read)
-    const std::vector<int64_t>& block_ids_list,  // block IDs to load
-    const std::vector<torch::Tensor>& dst_tensors,
-    int gpu_blocks_per_file) {
+    torch::Tensor cpu_buf,
+    const std::vector<int64_t>& block_ids_list,          // global block ids to place
+    const std::vector<torch::Tensor>& dst_tensors,       // per-layer GPU tensors [2, num_blocks_total, H, B, D]
+    int num_blocks_in_file,                               // blocks contained in this CPU buffer shard
+    const c10::cuda::CUDAStream& stream) {
 
-    // 1. Extract the shape of one KV block [2, H, B, D] from first destination tensor
-    auto sliced = dst_tensors[0].index({torch::indexing::Slice(), 0});
-    auto block_shape = sliced.sizes();  // (2, B, D)
+    TORCH_CHECK(!dst_tensors.empty(), "Destination tensors list is empty");
+    const auto& ref = dst_tensors[0];
+    TORCH_CHECK(ref.is_contiguous(), "dst_tensors must be contiguous");
+    TORCH_CHECK(cpu_buf.is_contiguous(), "cpu buffer must be contiguous");
 
-    // 2. Compute total elements per block
-    int64_t elems_per_block = 1;
-    for (auto s : block_shape) elems_per_block *= s;
-    int num_layers = dst_tensors.size();
-    int num_blocks = gpu_blocks_per_file;
-    int64_t expected_size = elems_per_block * num_layers * num_blocks;
-    // std::cout << "[DEBUG] expected_size (elements): " << expected_size
-    //           << " -> bytes: " << expected_size * dst_tensors[0].element_size() << std::endl;
+    const auto shape = ref.sizes(); // [2, num_blocks_total, H, B, D]
+    TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
+
+    const int64_t KVDim          = shape[0];
+    const int64_t num_blocks_tot = shape[1];
+    const int64_t H              = shape[2];
+    const int64_t B              = shape[3];
+    const int64_t D              = shape[4];
+
+    const size_t elem_size       = ref.element_size();
+    const int64_t elems_per_plane = H * B * D;
+    const size_t  bytes_per_plane = static_cast<size_t>(elems_per_plane) * elem_size;
+    const size_t  bytes_per_block = 2 * bytes_per_plane; // K + V
+    const int     num_layers      = static_cast<int>(dst_tensors.size());
 
 
+    auto* cpu_base = cpu_buf.data_ptr<uint8_t>();
 
-    // 3. Create a memory overview of CPU tensor over existing data_ptr.
-    auto data_ptr = buf.data_ptr<uint8_t>();
-    int64_t num_bytes = buf.numel();
-    int64_t num_elems = num_bytes / dst_tensors[0].element_size();
-    auto dtype = dst_tensors[0].dtype();
-    auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
-    torch::Tensor flat_tensor = torch::from_blob(
-        data_ptr,
-        {num_elems},
-        torch::TensorOptions().dtype(dst_tensors[0].dtype()).device(torch::kCPU)
-    );
+    // For each requested global block id
+    for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+        const int64_t gblock = block_ids_list[bi];
+        const int64_t lblock = (num_blocks_in_file > 0)
+                                 ? (gblock % num_blocks_in_file)
+                                 : 0; // for safety
+        const size_t cpu_block_base = static_cast<size_t>(lblock) * num_layers * bytes_per_block;
 
-    // 4. Validate file size
-    int64_t numel = flat_tensor.numel();
-    int64_t got_bytes = numel * flat_tensor.element_size();
-    int64_t expected_bytes = expected_size * dst_tensors[0].element_size();
+        for (int layer = 0; layer < num_layers; ++layer) {
+            const auto& layer_tensor = dst_tensors[layer];
+            auto* dst_base = reinterpret_cast<uint8_t*>(layer_tensor.data_ptr());
 
-    if (numel != expected_size) {
-        std::cerr << "[ERROR] File size mismatch: got " << numel
-                  << " elems (" << got_bytes << " bytes), expected "
-                  << expected_size << " elems (" << expected_bytes << " bytes)\n";
-        throw std::runtime_error(
-            "File size mismatch: got " + std::to_string(numel) + " elems (" +
-            std::to_string(got_bytes) + " bytes), expected " +
-            std::to_string(expected_size) + " elems (" +
-            std::to_string(expected_bytes) + " bytes)");
-    }
+            // GPU layout: [2, num_blocks_total, H, B, D] (contiguous)
+            // Correct byte offset for (kv, gblock) plane:
+            //   gpu_off(kv, gblock) = (kv * num_blocks_tot + gblock) * bytes_per_plane
+            for (int kv = 0; kv < 2; ++kv) {
+                const size_t cpu_off = cpu_block_base
+                                     + static_cast<size_t>(layer) * bytes_per_block
+                                     + static_cast<size_t>(kv) * bytes_per_plane;
 
-    // 5. Reshape flat buffer into 6D tensor [num_blocks, num_layers, 2, H, B, D]
-    std::vector<int64_t> new_shape = {num_blocks, num_layers};
-    new_shape.insert(new_shape.end(), block_shape.begin(), block_shape.end());
-    auto torch_arr = flat_tensor.view(new_shape);
-    // std::cout << "[DEBUG] torch_arr reshaped to: " << torch_arr.sizes() << std::endl;
+                const size_t gpu_off = (static_cast<size_t>(kv) * num_blocks_tot
+                                      + static_cast<size_t>(gblock)) * bytes_per_plane;
 
-    // Handle bf16 special case
-    if (dst_tensors[0].dtype() == torch::kBFloat16 && torch_arr.dtype() != torch::kBFloat16) {
-        torch_arr = torch_arr.view(torch::kBFloat16);
-    }
+                void* dst_ptr = dst_base + gpu_off;
+                void* src_ptr = cpu_base + cpu_off;
 
-    // 6. Offset calculation
-    int offset = 0;
-    int num_read_blocks = static_cast<int>(block_ids_list.size());
-    bool full_block = (block_ids_list.size() % gpu_blocks_per_file == 0);
-    if (!full_block) {
-        offset = num_blocks - block_ids_list.size();
-    }
+                const cudaError_t err = cudaMemcpyAsync(
+                    dst_ptr, src_ptr,
+                    bytes_per_plane,
+                    cudaMemcpyHostToDevice,
+                    stream.stream());
 
-    // 7. Build src_tensors for each layer
-    // Assert that slice length matches block_ids_list
-    TORCH_CHECK((num_blocks - offset) == (int)block_ids_list.size(),
-                "Mismatch: slice size != block_ids_list size");
+                if (err != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaMemcpyAsync failed: "
+                              << cudaGetErrorString(err)
+                              << " block=" << gblock
+                              << " layer=" << layer
+                              << " kv=" << kv
+                              << std::endl;
+                    return false;
+                }
 
-    // Build list of per-layer tensors, each shaped [2, num_blocks, H, B, D]
-    std::vector<torch::Tensor> src_tensors;
-    src_tensors.reserve(num_layers);
-
-    for (int i = 0; i < num_layers; i++) {
-        std::vector<torch::Tensor> blocks_for_layer;
-        blocks_for_layer.reserve(block_ids_list.size());
-
-        for (int j = 0; j < (int)block_ids_list.size(); j++) {
-            int global_b = block_ids_list[j];   // global block id
-            int local_b  = global_b % num_blocks; // offset inside this file
-
-            auto block_tensor = torch_arr[local_b][i];  // one block for this layer [2, H, B, D]
-            blocks_for_layer.push_back(block_tensor);
+            }
         }
-        // Stack all blocks along dim=1 → [2, num_blocks, H, B, D]
-        auto layer_tensor = torch::stack(blocks_for_layer, 1).contiguous();
-        src_tensors.push_back(layer_tensor);
     }
-
-    // 8. Build mapping tensor (src index → dst block_id)
-    std::vector<int64_t> mapping_vec;
-    mapping_vec.reserve(num_read_blocks * 2);
-    for (int i = 0; i < num_read_blocks; i++) {
-        mapping_vec.push_back(i);                   // src index in stacked tensor
-        mapping_vec.push_back(block_ids_list[i]);   // target block_id
-    }
-
-    // Convert mapping vector into CPU tensor [num_read_blocks, 2]
-    auto src_to_dst = torch::from_blob(
-        mapping_vec.data(),
-        {(int64_t)num_read_blocks, 2},
-        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)
-    ).clone();
-
-    // 9. Call backend to swap GPU blocks
-    swap_blocks_multi_layer(src_tensors, dst_tensors, src_to_dst);
 
     return true;
 }
@@ -710,7 +601,7 @@ bool transfer_async_get_ext(
                 try {
                     // Perform asynchronous GPU copy and tensor swap.
                     ok = copy_and_swap_gpu_tensors_ext(
-                        host_buf, block_ids, dst_tensors, gpu_blocks_per_file);
+                        host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream);
 
                     cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
                     if (err != cudaSuccess) {
