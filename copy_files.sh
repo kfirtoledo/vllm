@@ -8,14 +8,14 @@ FILES=(
 
   #Shared storage files
   "vllm/v1/offloading/worker/shared_storage.py"
-  "vllm/v1/offloading/shared_storage.py"
+  #"vllm/v1/offloading/shared_storage.py"
   #"tests/v1/offloading/test_shared_storage.py"
-  "vllm/v1/offloading/shared_storage_manager.py"
+  #"vllm/v1/offloading/shared_storage_manager.py"
   # "vllm/v1/offloading/mediums.py"
 
   # offloading
   # "vllm/v1/offloading/worker/worker.py"
-  "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py"
+  #"vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py"
   #"vllm/distributed/kv_transfer/kv_connector/factory.py"
 
   # CPU

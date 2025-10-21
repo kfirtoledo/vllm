@@ -167,7 +167,7 @@ def test_shared_storage_roundtrip_param(group_size: int, start_idx: int):
     """Test roundtrip save/load for multiple group sizes using model-like dimensions."""
     model_name = "llama3-70b"
     tp_size = 2
-    tp_rank = 0
+    tp_rank = 1
     dtype = torch.float16
     root_dir = TMP_DIR
     num_layers = 80

@@ -100,12 +100,14 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         storage_offload_ext.init_performance_resources(
             io_threads=self.threads_per_gpu,
             pinned_buffer_size_mb=self.buffer_size_mb,
-            max_pinned_memory_gb=self.max_pinned_memory_gb,  # TODO: separate pools for PUT/GET
+            max_pinned_memory_gb=self.max_pinned_memory_gb,
+            tp_rank=self.tp_rank,
         )
 
         logger.info(
             f"GPUStorageOffloadingHandler: "
             f"number_of_gpu={self.tp_size},"
+            f"tp_rank={self.tp_rank},"
             f"threads_per_gpu={self.threads_per_gpu},"
             f"pinned_buffer_size_mb={self.buffer_size_mb}, "
             f"max_pinned_memory_gb={self.max_pinned_memory_gb}, "
