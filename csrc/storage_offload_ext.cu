@@ -20,6 +20,8 @@
 #include <memory>
 #include <atomic>
 #include <optional>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace py = pybind11;
 
@@ -101,12 +103,15 @@ void preallocate_pinned_buffers(size_t io_threads, size_t pinned_buffer_size_mb)
             g_pinned_buffers[i] = {nullptr, 0};
         } else {
             g_pinned_buffers[i] = {ptr, alloc_bytes};
-            std::cout << "[INFO] Pre-allocated pinned buffer "
-                      << (alloc_bytes / (1024 * 1024))
-                      << " MB for thread " << i << std::endl;
+
         }
     }
+
+    std::cout << "[INFO] Pre-allocated pinned buffer "
+            << (alloc_bytes / (1024 * 1024))
+            << " MB for " << io_threads << " threads" << std::endl;
 }
+
 // -------------------------------
 // I/O thread pool for scheduling
 // -------------------------------
@@ -119,13 +124,32 @@ private:
     std::atomic<bool> stop{false};
 
 public:
-    IOThreadPool(size_t threads, size_t pinned_buffer_mb = 16) {
+    IOThreadPool(int threads, size_t pinned_buffer_mb, int tp_rank) {
         // Initialize PyTorch threading globally (main thread only)
         at::init_num_threads();
         at::set_num_threads(1);
 
         for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this, i, pinned_buffer_mb] {
+            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank] {
+                // Compute unique CPU per thread
+                int cpu_id = tp_rank * threads + i;
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(cpu_id, &cpuset);
+
+                if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+                    std::cerr << "[WARN] Failed to set affinity for thread " << i
+                              << " tp_rank=" << tp_rank << " to CPU " << cpu_id << "\n";
+                }
+
+                pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+                int actual_cpu = sched_getcpu();
+
+                std::cout << "[INFO] IO thread " << i
+                          << " (tid=" << tid << ", tp_rank=" << tp_rank
+                          << ") pinned to CPU " << cpu_id
+                          << " (running on CPU " << actual_cpu << ")\n";
+
                 if (i < g_pinned_buffers.size() && g_pinned_buffers[i].ptr != nullptr) {
                     t_pinned_ptr = g_pinned_buffers[i].ptr;
                     t_pinned_size = g_pinned_buffers[i].size;
@@ -188,7 +212,7 @@ static std::unique_ptr<IOThreadPool> g_io_pool;
 // -------------------------------
 
 // Initialize IO threads, CUDA streams, and pinned memory pool
-void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size_mb = 256 ,size_t max_pinned_memory_gb = 10) {
+void init_performance_resources(int io_threads = 0, size_t pinned_buffer_size_mb = 256 ,size_t max_pinned_memory_gb = 10, int tp_rank = 1) {
     if (!g_io_pool) {
         if (io_threads == 0) {
             io_threads = std::max(4u, std::thread::hardware_concurrency() / 2);
@@ -202,7 +226,7 @@ void init_performance_resources(size_t io_threads = 0, size_t pinned_buffer_size
         // Pre-allocate pinned buffers before launching threads
         preallocate_pinned_buffers(io_threads, pinned_buffer_size_mb);
 
-        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb);
+        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb, tp_rank);
         // Create dedicated streams for each thread
         g_streams.clear();
         g_streams.reserve(io_threads);
@@ -644,7 +668,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("init_performance_resources", &init_performance_resources,
           py::arg("io_threads") = 0,
           py::arg("pinned_buffer_size_mb") = 256,
-          py::arg("max_pinned_memory_gb") = 50);
+          py::arg("max_pinned_memory_gb") = 50,
+          py::arg("tp_rank") = 1);
 
     m.def("cleanup_performance_resources", &cleanup_performance_resources);
 
