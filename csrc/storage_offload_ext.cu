@@ -21,10 +21,21 @@
 #include <atomic>
 #include <optional>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cstring>
 
 namespace py = pybind11;
 
+#define TIME_EXPR(label, expr) ([&]() { \
+    auto __t0 = std::chrono::high_resolution_clock::now(); \
+    auto __ret = (expr); \
+    auto __t1 = std::chrono::high_resolution_clock::now(); \
+    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count(); \
+    std::cout << "[TIME] " << label << " took " << __ms << " ms\n"; \
+    return __ret; \
+})()
 // -------------------------------------
 // Thread-local pinned buffer
 // -------------------------------------
@@ -55,8 +66,6 @@ static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
     }
     return {t_pinned_ptr, t_pinned_size};
 }
-
-
 // Tracks async job progress and results
 struct JobState {
     // Futures for each async task in the job
@@ -349,7 +358,7 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
 
 
 // File write helpers - optimized for large writes
-bool flush_one_to_disk_fast(const std::string &target_path,
+bool write_file_to_disk(const std::string &target_path,
                             const torch::Tensor &host_buf) {
     const void* data_ptr = host_buf.data_ptr();
     // Get total number of bytes to write
@@ -414,7 +423,9 @@ bool transfer_async_put_ext(int job_id,
                 cudaStreamSynchronize(thread_stream->stream());
 
                 // Stage 3: Write the pinned buffer to disk (blocking operation).
-                bool ok = flush_one_to_disk_fast(target, host_buf);
+                bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
+                //bool ok = write_file_to_disk(target, host_buf);
+
                 if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
 
