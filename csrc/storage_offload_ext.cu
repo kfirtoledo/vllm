@@ -502,15 +502,14 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     // std::cout << "[INFO] 2/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
     return tensor;
 }
-
 // Copy buffer to GPU tensors asynchronously using cudaMemcpyAsync (no swap_blocks)
 // CPU layout (contiguous): [num_blocks_in_file, num_layers, 2, H, B, D]
 // GPU layout (contiguous): [2, num_blocks_total, H, B, D]
-bool copy_and_swap_gpu_tensors_ext(
+bool copy_buffer_to_gpu_tensors(
     torch::Tensor cpu_buf,
-    const std::vector<int64_t>& block_ids_list,          // global block ids to place
-    const std::vector<torch::Tensor>& dst_tensors,       // per-layer GPU tensors [2, num_blocks_total, H, B, D]
-    int num_blocks_in_file,                               // blocks contained in this CPU buffer shard
+    const std::vector<int64_t>& block_ids_list,
+    const std::vector<torch::Tensor>& dst_tensors,
+    int num_blocks_in_file,
     const c10::cuda::CUDAStream& stream) {
 
     TORCH_CHECK(!dst_tensors.empty(), "Destination tensors list is empty");
@@ -518,66 +517,59 @@ bool copy_and_swap_gpu_tensors_ext(
     TORCH_CHECK(ref.is_contiguous(), "dst_tensors must be contiguous");
     TORCH_CHECK(cpu_buf.is_contiguous(), "cpu buffer must be contiguous");
 
-    const auto shape = ref.sizes(); // [2, num_blocks_total, H, B, D]
+    const auto shape = ref.sizes();  // [2, num_blocks_total, H, B, D]
     TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
 
-    const int64_t KVDim          = shape[0];
     const int64_t num_blocks_tot = shape[1];
-    const int64_t H              = shape[2];
-    const int64_t B              = shape[3];
-    const int64_t D              = shape[4];
+    const int64_t H = shape[2];
+    const int64_t B = shape[3];
+    const int64_t D = shape[4];
+    const int num_layers = static_cast<int>(dst_tensors.size());
 
-    const size_t elem_size       = ref.element_size();
-    const int64_t elems_per_plane = H * B * D;
-    const size_t  bytes_per_plane = static_cast<size_t>(elems_per_plane) * elem_size;
-    const size_t  bytes_per_block = 2 * bytes_per_plane; // K + V
-    const int     num_layers      = static_cast<int>(dst_tensors.size());
-
+    const size_t elem_size = ref.element_size();
+    const size_t bytes_per_plane = static_cast<size_t>(H * B * D) * elem_size;
+    const size_t bytes_per_block = 2 * bytes_per_plane;  // [K,V] in CPU buf
 
     auto* cpu_base = cpu_buf.data_ptr<uint8_t>();
 
-    // For each requested global block id
     for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
         const int64_t gblock = block_ids_list[bi];
-        const int64_t lblock = (num_blocks_in_file > 0)
-                                 ? (gblock % num_blocks_in_file)
-                                 : 0; // for safety
+        const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
         const size_t cpu_block_base = static_cast<size_t>(lblock) * num_layers * bytes_per_block;
 
         for (int layer = 0; layer < num_layers; ++layer) {
             const auto& layer_tensor = dst_tensors[layer];
             auto* dst_base = reinterpret_cast<uint8_t*>(layer_tensor.data_ptr());
 
-            // GPU layout: [2, num_blocks_total, H, B, D] (contiguous)
-            // Correct byte offset for (kv, gblock) plane:
-            //   gpu_off(kv, gblock) = (kv * num_blocks_tot + gblock) * bytes_per_plane
-            for (int kv = 0; kv < 2; ++kv) {
-                const size_t cpu_off = cpu_block_base
-                                     + static_cast<size_t>(layer) * bytes_per_block
-                                     + static_cast<size_t>(kv) * bytes_per_plane;
+            // Compute CPU source offsets for K and V
+            const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
+            const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
 
-                const size_t gpu_off = (static_cast<size_t>(kv) * num_blocks_tot
-                                      + static_cast<size_t>(gblock)) * bytes_per_plane;
+            // Compute GPU destination offsets for K and V
+            const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
+            const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
 
-                void* dst_ptr = dst_base + gpu_off;
-                void* src_ptr = cpu_base + cpu_off;
+            void* dst_K = dst_base + gpu_K_off;
+            void* dst_V = dst_base + gpu_V_off;
+            void* src_K = cpu_base + cpu_K_off;
+            void* src_V = cpu_base + cpu_V_off;
 
-                const cudaError_t err = cudaMemcpyAsync(
-                    dst_ptr, src_ptr,
-                    bytes_per_plane,
-                    cudaMemcpyHostToDevice,
-                    stream.stream());
 
-                if (err != cudaSuccess) {
-                    std::cerr << "[ERROR] cudaMemcpyAsync failed: "
-                              << cudaGetErrorString(err)
-                              << " block=" << gblock
-                              << " layer=" << layer
-                              << " kv=" << kv
-                              << std::endl;
-                    return false;
-                }
+            cudaError_t err1 = cudaMemcpyAsync(
+                dst_K, src_K, bytes_per_plane,
+                cudaMemcpyHostToDevice, stream.stream());
 
+            cudaError_t err2 = cudaMemcpyAsync(
+                dst_V, src_V, bytes_per_plane,
+                cudaMemcpyHostToDevice, stream.stream());
+
+            if (err1 != cudaSuccess || err2 != cudaSuccess) {
+                std::cerr << "[ERROR] cudaMemcpyAsync failed for block=" << gblock
+                          << " layer=" << layer
+                          << " err1=" << cudaGetErrorString(err1)
+                          << " err2=" << cudaGetErrorString(err2)
+                          << std::endl;
+                return false;
             }
         }
     }
@@ -619,7 +611,8 @@ bool transfer_async_get_ext(
             torch::Tensor host_buf;
             try {
                 // Read data from disk into pinned memory tensor.
-                host_buf = read_file_to_pinned_tensor(src_file);
+                //host_buf = read_file_to_pinned_tensor(src_file);
+                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file));
                 stage1_ok = true;
             } catch (const std::exception& e) {
                 std::cerr << "[ERROR] Stage1 read_file_to_pinned_tensor failed for "
@@ -635,7 +628,7 @@ bool transfer_async_get_ext(
             if (stage1_ok) {
                 try {
                     // Perform asynchronous GPU copy and tensor swap.
-                    ok = copy_and_swap_gpu_tensors_ext(
+                    ok = copy_buffer_to_gpu_tensors(
                         host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream);
 
                     cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
