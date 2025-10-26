@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <cstdio>
+#include <liburing.h>
 
 namespace py = pybind11;
 
@@ -87,6 +89,8 @@ static std::vector<at::cuda::CUDAStream> g_streams;
 static thread_local std::optional<c10::cuda::CUDAStream> thread_stream;
 // Thread-local stream index for mapping worker threads to streams
 static thread_local size_t thread_stream_idx = 0;
+
+thread_local io_uring* t_ring = nullptr;
 
 // Mutex protecting access to the jobs map
 static std::mutex jobs_mutex;
@@ -168,6 +172,19 @@ public:
                 } else {
                     std::cerr << "[WARN] IO thread " << i
                             << " has no preallocated pinned buffer\n";
+                }
+                // Initialize io_uring for this thread
+                if (!t_ring) {
+                    t_ring = new io_uring();
+                    int ret = io_uring_queue_init(256, t_ring, 0);
+                    if (ret < 0) {
+                        std::cerr << "[ERROR] Failed to initialize io_uring for thread "
+                                << i << ": " << strerror(-ret) << std::endl;
+                        t_ring = nullptr;
+                    } else {
+                        std::cout << "[INFO] io_uring initialized for thread "
+                                << i << " with depth 256\n";
+                    }
                 }
 
                 thread_stream_idx = i;
@@ -291,6 +308,13 @@ void cleanup_performance_resources() {
         t_pinned_ptr = nullptr;
         t_pinned_size = 0;
     }
+
+    // Cleanup io_uring when thread exits
+    if (t_ring) {
+        io_uring_queue_exit(t_ring);
+        delete t_ring;
+        t_ring = nullptr;
+    }
 }
 
 //----------------------------------------------------------------------
@@ -352,33 +376,49 @@ torch::Tensor copy_gpu_tensors_to_buffer(
 
 // File write helpers - optimized for large writes
 bool write_file_to_disk(const std::string &target_path,
-                        const torch::Tensor &host_buf) {
-    // Write to temporary file first
+                                 const torch::Tensor &host_buf,
+                                 io_uring* ring) {
     const void* data_ptr = host_buf.data_ptr();
-    // Get total number of bytes to write
     size_t nbytes = host_buf.nbytes();
-    // Write first to a temporary file to ensure atomic rename later
     std::string tmp_path = target_path + ".tmp";
 
-    // Define a larger buffer (1MB) to reduce syscall overhead and speed up I/O
-    const size_t WRITE_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB buffer
-
-    std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
-    if (!ofs) {
-        std::cerr << "[ERROR] Failed to open temporary file for writing: " << tmp_path << "\n";
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::cerr << "[ERROR] open failed: " << tmp_path << "\n";
         return false;
     }
 
-    // Allocate custom I/O buffer for this stream (replaces small default buffer)
-    std::vector<char> buffer(WRITE_BUFFER_SIZE);
-    // Apply the custom buffer to the file stream
-    ofs.rdbuf()->pubsetbuf(buffer.data(), WRITE_BUFFER_SIZE);
+    struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        std::cerr << "[ERROR] io_uring_get_sqe failed\n";
+        ::close(fd);
+        return false;
+    }
 
-    ofs.write(reinterpret_cast<const char*>(data_ptr), nbytes);
-    ofs.close();
-    // std::cout << "[INFO] Written " << nbytes << " bytes to temporary file: " << tmp_path << "\n";
-    // Atomically rename temp file to final target name after successful write
-    return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
+    io_uring_prep_write(sqe, fd, data_ptr, nbytes, 0);
+    sqe->flags |= IOSQE_IO_LINK; // optional: chain writes if batching
+
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+        std::cerr << "[ERROR] io_uring_submit failed: " << strerror(-ret) << "\n";
+        ::close(fd);
+        return false;
+    }
+
+    struct io_uring_cqe* cqe;
+    ret = io_uring_wait_cqe(ring, &cqe);
+    if (ret < 0 || cqe->res < 0) {
+        std::cerr << "[ERROR] io_uring write failed: " << strerror(-cqe->res) << "\n";
+        io_uring_cqe_seen(ring, cqe);
+        ::close(fd);
+        return false;
+    }
+
+    io_uring_cqe_seen(ring, cqe);
+    ::close(fd);
+
+    std::rename(tmp_path.c_str(), target_path.c_str());
+    return true;
 }
 
 // Async GPU → Storage transfer (PUT)
@@ -417,7 +457,7 @@ bool transfer_async_put_ext(int job_id,
 
                 // Stage 3: Write the pinned buffer to disk (blocking operation).
                 //bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
-                bool ok = write_file_to_disk(target, host_buf);
+                bool ok = write_file_to_disk(target, host_buf, t_ring);
 
                 if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
@@ -453,48 +493,80 @@ bool transfer_async_put_ext(int job_id,
 // ----------------------------------------------------------------------
 
 // Read a file into a pinned CPU tensor from the pool
-torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
-
-    // Open file
-    std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
-    if (!ifs) {
-        std::cerr << "[ERROR] Failed to open file: " << path << "\n";
-        throw std::runtime_error("Failed to open file: " + path);
+torch::Tensor read_file_to_pinned_tensor(const std::string& path, io_uring* ring) {
+    if (ring == nullptr) {
+        std::cerr << "[ERROR] io_uring ring is null for thread when reading " << path << "\n";
+        throw std::runtime_error("io_uring ring not initialized");
     }
 
-    // Determine file size
-    size_t file_size = static_cast<size_t>(ifs.tellg());
-    ifs.seekg(0, std::ios::beg);
+    // Get file size via stat
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        std::cerr << "[ERROR] stat failed for " << path << ": " << strerror(errno) << "\n";
+        throw std::runtime_error("stat failed for " + path);
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
 
-    // Get pinned buffer from pool
+    // Allocate pinned buffer
     auto [pinned_ptr, pinned_size] = get_thread_local_pinned(file_size);
     if (!pinned_ptr || pinned_size < file_size) {
-        std::cerr << "[ERROR] Pinned buffer too small for file: " << path << "\n"
-                  << "[INFO] Required size: " << file_size << " bytes, Available size: " << pinned_size << " bytes\n"
-                  << "pinned_ptr: " << pinned_ptr << "\n";
-        throw std::runtime_error("Pinned buffer too small for file: " + path);
+        std::cerr << "[ERROR] pinned buffer too small for file " << path
+                  << " need " << file_size << " have " << pinned_size << "\n";
+        throw std::runtime_error("pinned buffer too small");
     }
 
-    // Read into pinned memory
-    ifs.read(reinterpret_cast<char*>(pinned_ptr), file_size);
-    ifs.close();
-    //std::cout << "[INFO] 1/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
-    // Wrap pinned buffer into a Torch tensor (CPU, pinned)
+    // Open the file
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "[ERROR] open failed for " << path << ": " << strerror(errno) << "\n";
+        throw std::runtime_error("open failed for " + path);
+    }
+
+    // Prepare and submit read
+    io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        ::close(fd);
+        std::cerr << "[ERROR] io_uring_get_sqe failed for " << path << "\n";
+        throw std::runtime_error("io_uring_get_sqe failed");
+    }
+
+    io_uring_prep_read(sqe, fd, pinned_ptr, file_size, 0);
+
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+        ::close(fd);
+        std::cerr << "[ERROR] io_uring_submit failed: " << strerror(-ret) << "\n";
+        throw std::runtime_error("io_uring_submit failed");
+    }
+
+    // Wait for completion
+    io_uring_cqe* cqe = nullptr;
+    ret = io_uring_wait_cqe(ring, &cqe);
+    if (ret < 0 || cqe->res < 0) {
+        const int err = (ret < 0) ? -ret : -cqe->res;
+        if (cqe) io_uring_cqe_seen(ring, cqe);
+        ::close(fd);
+        std::cerr << "[ERROR] io_uring read failed for " << path << ": " << strerror(err) << "\n";
+        throw std::runtime_error("io_uring read failed");
+    }
+
+    io_uring_cqe_seen(ring, cqe);
+    ::close(fd);
+
+    // Wrap pinned buffer into a Torch tensor (no copy)
     auto options = torch::TensorOptions()
-        .dtype(torch::kUInt8)  // raw bytes
+        .dtype(torch::kUInt8)
         .device(torch::kCPU)
         .pinned_memory(true);
 
-    // Wrap without copy, need free pinned_ptr.
-    auto tensor = torch::from_blob(
+    return torch::from_blob(
         pinned_ptr,
         {static_cast<long>(file_size)},
-        [pinned_ptr](void* /*unused*/) {},
+        [pinned_ptr](void* /*unused*/) {},  // no-op deleter
         options
     );
-    // std::cout << "[INFO] 2/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
-    return tensor;
 }
+
 // Copy buffer to GPU tensors asynchronously using cudaMemcpyAsync (no swap_blocks)
 // CPU layout (contiguous): [num_blocks_in_file, num_layers, 2, H, B, D]
 // GPU layout (contiguous): [2, num_blocks_total, H, B, D]
@@ -605,7 +677,7 @@ bool transfer_async_get_ext(
             try {
                 // Read data from disk into pinned memory tensor.
                 //host_buf = read_file_to_pinned_tensor(src_file);
-                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file));
+                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file, t_ring));
                 stage1_ok = true;
             } catch (const std::exception& e) {
                 std::cerr << "[ERROR] Stage1 read_file_to_pinned_tensor failed for "

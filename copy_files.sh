@@ -25,7 +25,7 @@ FILES=(
   #vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
 
   # CUDA
-  #"csrc/setup_torch.py"
+  "csrc/setup_torch.py"
   "csrc/storage_offload_ext.cu"
   #"csrc/setup.py"
   # "csrc/cache.h"
