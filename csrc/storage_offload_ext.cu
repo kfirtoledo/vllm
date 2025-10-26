@@ -297,16 +297,16 @@ void cleanup_performance_resources() {
 // GPU → Storage (PUT)
 // ----------------------------------------------------------------------
 // Copy selected GPU tensor blocks into pinned CPU buffer asynchronously
-torch::Tensor copy_gpu_tensors_to_buffer_async(
+torch::Tensor copy_gpu_tensors_to_buffer(
     const std::vector<torch::Tensor>& src_tensors,
     const std::vector<int64_t>& block_ids_list,
     const c10::cuda::CUDAStream& stream) {
 
-    // Calculate total size first
-    size_t total_elements = 0;
     auto dtype = src_tensors[0].dtype();
     size_t element_size = src_tensors[0].element_size();
 
+    // Calculate dimensions
+    size_t total_elements = 0;
     for (int64_t block_id : block_ids_list) {
         for (const auto &tensor : src_tensors) {
             auto block = tensor.index({torch::indexing::Slice(), block_id});
@@ -317,37 +317,31 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
     size_t required_bytes = total_elements * element_size;
     auto [pinned_ptr, pinned_size] = get_thread_local_pinned(required_bytes);
 
-    torch::Tensor result_cpu;
-
-    // Use pinned memory - much faster transfer
-    std::vector<torch::Tensor> blocks;
-    blocks.reserve(src_tensors.size() * block_ids_list.size());
-
-    for (int64_t block_id : block_ids_list) {
-        for (const auto &tensor : src_tensors) {
-            auto block = tensor.index({torch::indexing::Slice(), block_id});
-            blocks.push_back(block.contiguous());
-        }
-    }
-
-    // Concatenate all selected [K,V] block slices into one big tensor along dim=0 → [2 * num_layers * num_blocks, H, B, D]
-    auto flat_gpu = torch::cat(blocks, 0);
-
-    // Create memory view of CPU tensor using pinned memory
-    result_cpu = torch::from_blob(
+    // Create output tensor view
+    torch::Tensor result_cpu = torch::from_blob(
         pinned_ptr,
         {static_cast<long>(total_elements)},
         torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true)
     );
 
-    // Async copy GPU -> pinned CPU memory
-    cudaMemcpyAsync(
-        pinned_ptr,
-        flat_gpu.data_ptr(),
-        required_bytes,
-        cudaMemcpyDeviceToHost,
-        stream.stream()
-    );
+    // Direct async copy without intermediate cat
+    size_t offset = 0;
+    for (int64_t block_id : block_ids_list) {
+        for (const auto &tensor : src_tensors) {
+            auto block = tensor.index({torch::indexing::Slice(), block_id}).contiguous();
+            size_t block_bytes = block.nbytes();
+
+            cudaMemcpyAsync(
+                static_cast<char*>(pinned_ptr) + offset,
+                block.data_ptr(),
+                block_bytes,
+                cudaMemcpyDeviceToHost,
+                stream.stream()
+            );
+
+            offset += block_bytes;
+        }
+    }
 
     if (result_cpu.dtype() == torch::kBFloat16) {
         result_cpu = result_cpu.view(torch::kUInt16);
@@ -356,10 +350,10 @@ torch::Tensor copy_gpu_tensors_to_buffer_async(
     return result_cpu;
 }
 
-
 // File write helpers - optimized for large writes
 bool write_file_to_disk(const std::string &target_path,
-                            const torch::Tensor &host_buf) {
+                        const torch::Tensor &host_buf) {
+    // Write to temporary file first
     const void* data_ptr = host_buf.data_ptr();
     // Get total number of bytes to write
     size_t nbytes = host_buf.nbytes();
@@ -386,7 +380,6 @@ bool write_file_to_disk(const std::string &target_path,
     // Atomically rename temp file to final target name after successful write
     return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
 }
-
 
 // Async GPU → Storage transfer (PUT)
 bool transfer_async_put_ext(int job_id,
@@ -417,14 +410,14 @@ bool transfer_async_put_ext(int job_id,
 
             try {
                 // Stage 1: Asynchronously copy tensors from GPU to pinned CPU buffer.
-                auto host_buf = copy_gpu_tensors_to_buffer_async(src, bids, *thread_stream);
+                auto host_buf = copy_gpu_tensors_to_buffer(src, bids, *thread_stream);
 
                 // Stage 2: Synchronize only this thread's CUDA stream (not all).
                 cudaStreamSynchronize(thread_stream->stream());
 
                 // Stage 3: Write the pinned buffer to disk (blocking operation).
-                bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
-                //bool ok = write_file_to_disk(target, host_buf);
+                //bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
+                bool ok = write_file_to_disk(target, host_buf);
 
                 if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
