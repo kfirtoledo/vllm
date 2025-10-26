@@ -16,8 +16,8 @@ logger = init_logger(__name__)
 # ----------------------------------------------------------------------
 # Base Storage Offloading Handler
 # ----------------------------------------------------------------------
-DEFAULT_MAX_PINNED_MEMORY_GB = 100
-DEFAULT_MAX_THREADS_PER_GPU = 32
+DEFAULT_MAX_PINNED_MEMORY_GB = 20
+DEFAULT_MAX_THREADS_PER_GPU = 64
 
 class StorageOffloadingHandler(OffloadingHandler):
     """Base handler with common helpers for Storage offloading."""
@@ -37,7 +37,7 @@ class StorageOffloadingHandler(OffloadingHandler):
         self.dtype = dtype
         self.gpu_blocks_per_file = gpu_blocks_per_file
         self.base_path = self.get_kv_cache_base_path(model_name, tp_size, tp_rank, dtype, root_dir)
-        self.threads_per_gpu = min(threads_per_gpu , int(os.cpu_count()/tp_size), DEFAULT_MAX_THREADS_PER_GPU)
+        self.threads_per_gpu = min(threads_per_gpu , int(os.cpu_count()), DEFAULT_MAX_THREADS_PER_GPU)
         self.max_pinned_memory_gb = max_pinned_memory_gb
         self.h2d_stream = torch.cuda.Stream()
         self.d2h_stream = torch.cuda.Stream()
@@ -95,6 +95,10 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
 
         self.src_tensors = src_tensors
         self.buffer_size_mb = self.compute_pinned_mb(src_tensors, gpu_blocks_per_file)
+        if self.buffer_size_mb * self.threads_per_gpu > self.max_pinned_memory_gb * 1024:
+            self.threads_per_gpu = min(self.threads_per_gpu, self.max_pinned_memory_gb // self.buffer_size_mb)
+            print(f"[WARN] Adjusted threads_per_gpu to {self.threads_per_gpu} due to max_pinned_memory_gb {self.max_pinned_memory_gb} limit "+
+                  f" (buffer_size_mb={self.buffer_size_mb}).")
 
         # TODO set different init for each class
         storage_offload_ext.init_performance_resources(
