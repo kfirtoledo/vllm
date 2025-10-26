@@ -27,20 +27,43 @@
 #include <cstring>
 
 namespace py = pybind11;
+// -------------------------------------
+// Debugging and timing macros
+// -------------------------------------
 
-#define TIME_EXPR(label, expr) ([&]() { \
-    auto __t0 = std::chrono::high_resolution_clock::now(); \
-    auto __ret = (expr); \
-    auto __t1 = std::chrono::high_resolution_clock::now(); \
+#define DEBUG_PRINT(msg)                                                     \
+    do {                                                                     \
+        const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");            \
+        if (env && std::string(env) != "0")                                 \
+            std::cout << "[DEBUG] " << msg << std::endl;                     \
+    } while (0)
+
+// Timing macro - measures only if STORAGE_CONNECTOR_DEBUG is not "0"
+#define TIME_EXPR(label, expr) ([&]() {                                      \
+    const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");                \
+    if (!(env && std::string(env) == "1"))  {                                   \
+        /* Debug disabled: just execute expression */                        \
+        return (expr);                                                       \
+    }                                                                        \
+    auto __t0 = std::chrono::high_resolution_clock::now();                   \
+    auto __ret = (expr);                                                     \
+    auto __t1 = std::chrono::high_resolution_clock::now();                   \
     double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count(); \
-    std::cout << "[TIME] " << label << " took " << __ms << " ms\n"; \
-    return __ret; \
+    std::cout << "[DEBUG][TIME] " << label << " took " << __ms << " ms\n";          \
+    return __ret;                                                            \
 })()
+
 // -------------------------------------
 // Thread-local pinned buffer
 // -------------------------------------
+struct PinnedBufferInfo {
+    void* ptr = nullptr;
+    size_t size = 0;
+};
+
 static thread_local void* t_pinned_ptr = nullptr;
 static thread_local size_t t_pinned_size = 0;
+static std::vector<PinnedBufferInfo> g_pinned_buffers;
 
 static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
     if (!t_pinned_ptr || t_pinned_size < required_bytes) {
@@ -50,22 +73,56 @@ static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
             t_pinned_size = 0;
         }
 
-        size_t alloc_size = std::max(required_bytes, (size_t)16 * 1024 * 1024); // at least 16 MB
-        cudaError_t err = cudaMallocHost(&t_pinned_ptr, alloc_size);
+        size_t alloc_size = std::max(required_bytes, (size_t)16 * 1024 * 1024);
+        cudaError_t err = cudaHostAlloc(
+            &t_pinned_ptr,
+            alloc_size,
+            cudaHostAllocMapped | cudaHostAllocPortable
+        );
+
         if (err != cudaSuccess) {
-            std::cerr << "[ERROR] cudaMallocHost failed: "
+            std::cerr << "[ERROR] cudaHostAlloc failed: "
                       << cudaGetErrorString(err) << "\n";
             t_pinned_ptr = nullptr;
             t_pinned_size = 0;
         } else {
             t_pinned_size = alloc_size;
-            std::cout << "[INFO] Thread " << std::this_thread::get_id()
+            DEBUG_PRINT("[INFO] Thread " << std::this_thread::get_id()
                       << " allocated pinned buffer "
-                      << (alloc_size / (1024 * 1024)) << " MB\n";
+                      << (alloc_size / (1024 * 1024)) << " MB\n");
         }
     }
     return {t_pinned_ptr, t_pinned_size};
 }
+
+void preallocate_pinned_buffers(size_t io_threads, size_t pinned_buffer_size_mb) {
+    g_pinned_buffers.resize(io_threads);
+    size_t alloc_bytes = pinned_buffer_size_mb * 1024 * 1024;
+
+    std::vector<std::thread> workers;
+    workers.reserve(io_threads);
+
+    for (size_t i = 0; i < io_threads; ++i) {
+        workers.emplace_back([i, alloc_bytes]() {
+            auto [ptr, size] = get_thread_local_pinned(alloc_bytes);
+            if (!ptr) {
+                std::cerr << "[ERROR] Failed to preallocate pinned buffer for thread "
+                          << i << std::endl;
+                g_pinned_buffers[i] = {nullptr, 0};
+            } else {
+                g_pinned_buffers[i] = {ptr, size};
+            }
+        });
+    }
+
+    // Wait for all threads to complete initialization
+    for (auto& t : workers) t.join();
+
+    std::cout << "[INFO] Pre-allocated pinned buffer "
+              << (alloc_bytes / (1024 * 1024))
+              << " MB for " << io_threads << " threads" << std::endl;
+}
+
 // Tracks async job progress and results
 struct JobState {
     // Futures for each async task in the job
@@ -93,33 +150,66 @@ static std::mutex jobs_mutex;
 // Global map of job_id → JobState, tracking async job progress
 static std::map<int, std::unique_ptr<JobState>> jobs;
 
-struct PinnedBufferInfo {
-    void* ptr = nullptr;
-    size_t size = 0;
-};
 
-static std::vector<PinnedBufferInfo> g_pinned_buffers;
-void preallocate_pinned_buffers(size_t io_threads, size_t pinned_buffer_size_mb) {
-    g_pinned_buffers.resize(io_threads);
-    size_t alloc_bytes = pinned_buffer_size_mb * 1024 * 1024;
+// Optimized memcpy kernel using vectorized loads
+template<typename T = uint4>
+__global__ void memcpy_kernel(const char* __restrict__ src,
+                              char* __restrict__ dst,
+                              size_t num_bytes) {
+    // Vector size (default: 16 bytes if T=uint4)
+    constexpr size_t vec_size = sizeof(T);
+    // Number of full vector elements we can copy
+    const size_t total_vecs = num_bytes / vec_size;
+    // Global stride: total number of threads across all blocks in the grid (gridDim.x = number of blocks, blockDim.x = threads per block)
+    // Each thread will advance by this stride in the loop to cover all data
+    const size_t stride = gridDim.x * blockDim.x;
+    // Reinterpret byte pointers as vector types to enable wide 16-byte loads/stores
+    const T* src_vec = reinterpret_cast<const T*>(src);
+    T* dst_vec = reinterpret_cast<T*>(dst);
 
-    for (size_t i = 0; i < io_threads; ++i) {
-        void* ptr = nullptr;
-        cudaError_t err = cudaMallocHost(&ptr, alloc_bytes);
-        if (err != cudaSuccess) {
-            std::cerr << "[ERROR] Failed to allocate pinned buffer for thread "
-                      << i << ": " << cudaGetErrorString(err) << std::endl;
-            g_pinned_buffers[i] = {nullptr, 0};
-        } else {
-            g_pinned_buffers[i] = {ptr, alloc_bytes};
-
-        }
+    // Each thread copies multiple vector elements starting from its global index, jumping by 'stride' each iteration
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_vecs;
+         idx += stride) {
+        dst_vec[idx] = src_vec[idx];
     }
 
-    std::cout << "[INFO] Pre-allocated pinned buffer "
-            << (alloc_bytes / (1024 * 1024))
-            << " MB for " << io_threads << " threads" << std::endl;
+    // Remaining tail bytes
+    size_t tail_start = total_vecs * vec_size;
+    for (size_t i = tail_start + blockIdx.x * blockDim.x + threadIdx.x;
+         i < num_bytes;
+         i += stride) {
+        dst[i] = src[i];
+    }
 }
+
+// Launch helper function
+inline void launch_memcpy_kernel(
+    const void* src,
+    void* dst,
+    size_t bytes,
+    const c10::cuda::CUDAStream& stream) {
+
+    if (bytes == 0) return;
+
+    constexpr int threads = 256;
+    // Compute number of blocks to cover all data; limit to 1024 for practicality
+    int blocks = std::min((int)((bytes + threads - 1) / threads), 1024);
+
+    memcpy_kernel<<<blocks, threads, 0, stream.stream()>>>(
+        static_cast<const char*>(src),
+        static_cast<char*>(dst),
+        bytes);
+
+    // Check for launch errors
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        std::cerr << "[ERROR] Kernel launch failed: "
+                  << cudaGetErrorString(launch_err) << std::endl;
+    }
+}
+
+
 
 // -------------------------------
 // I/O thread pool for scheduling
@@ -131,15 +221,21 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition;
     std::atomic<bool> stop{false};
+    int m_device_id;
 
 public:
-    IOThreadPool(int threads, size_t pinned_buffer_mb, int tp_rank) {
+       IOThreadPool(int threads, size_t pinned_buffer_mb, int tp_rank, int device_id) : m_device_id(device_id) {
+
         // Initialize PyTorch threading globally (main thread only)
         at::init_num_threads();
         at::set_num_threads(1);
 
         for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank] {
+            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank, device_id] {
+
+                // Set CUDA device for this thread FIRST
+                cudaSetDevice(device_id);
+
                 // Compute unique CPU per thread
                 int cpu_id = tp_rank * threads + i;
                 cpu_set_t cpuset;
@@ -154,23 +250,26 @@ public:
                 pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
                 int actual_cpu = sched_getcpu();
 
-                std::cout << "[INFO] IO thread " << i
+                DEBUG_PRINT("IO thread " << i
+                          << " set CUDA device to " << device_id
                           << " (tid=" << tid << ", tp_rank=" << tp_rank
                           << ") pinned to CPU " << cpu_id
-                          << " (running on CPU " << actual_cpu << ")\n";
+                          << " (running on CPU " << actual_cpu << ")\n");
 
+                // Attach preallocated pinned buffer
                 if (i < g_pinned_buffers.size() && g_pinned_buffers[i].ptr != nullptr) {
                     t_pinned_ptr = g_pinned_buffers[i].ptr;
                     t_pinned_size = g_pinned_buffers[i].size;
-                    std::cout << "[INFO] IO thread " << i
+                    DEBUG_PRINT("IO thread " << i
                             << " attached to preallocated pinned buffer "
-                            << (t_pinned_size / (1024 * 1024)) << " MB\n";
+                            << (t_pinned_size / (1024 * 1024)) << " MB");
                 } else {
                     std::cerr << "[WARN] IO thread " << i
                             << " has no preallocated pinned buffer\n";
                 }
 
                 thread_stream_idx = i;
+
                 while (true) {
                     std::function<void()> task;
                     {
@@ -221,26 +320,36 @@ static std::unique_ptr<IOThreadPool> g_io_pool;
 // -------------------------------
 
 // Initialize IO threads, CUDA streams, and pinned memory pool
-void init_performance_resources(int io_threads = 0, size_t pinned_buffer_size_mb = 256 ,size_t max_pinned_memory_gb = 10, int tp_rank = 1) {
+void init_performance_resources(int io_threads = 0, size_t pinned_buffer_size_mb = 256, size_t max_pinned_memory_gb = 10, int tp_rank = 1) {
     if (!g_io_pool) {
         if (io_threads == 0) {
             io_threads = std::max(4u, std::thread::hardware_concurrency() / 2);
         }
+
+        // Get current device (should be set by vLLM before calling this)
+        int device_id;
+        cudaGetDevice(&device_id);
+
         std::cout << "[INFO] Initializing IOThreadPool with "
-                  << io_threads << " threads, "
-                  << pinned_buffer_size_mb << " MB pinned buffer per thread, "
-                  << max_pinned_memory_gb << " GB max pinned memory\n"
-                  << std::thread::hardware_concurrency() << " hardware_concurrency\n";
+                  << io_threads << " threads on device " << device_id
+                  << ", " << pinned_buffer_size_mb << " MB pinned buffer per thread, "
+                  << max_pinned_memory_gb << " GB max pinned memory\n";
+
+        // Enable GPU access to mapped host memory (needed only for cudaHostAllocMapped before any CUDA context)
+        cudaSetDeviceFlags(cudaDeviceMapHost);
 
         // Pre-allocate pinned buffers before launching threads
         preallocate_pinned_buffers(io_threads, pinned_buffer_size_mb);
 
-        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb, tp_rank);
-        // Create dedicated streams for each thread
+        // Pass device_id to thread pool
+        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb,
+                                                    tp_rank, device_id);
+
+        // Create dedicated streams for each thread on the current device
         g_streams.clear();
         g_streams.reserve(io_threads);
         for (size_t i = 0; i < io_threads; i++) {
-            g_streams.push_back(at::cuda::getStreamFromPool(/*isHighPriority=*/false));
+            g_streams.push_back(at::cuda::getStreamFromPool(/*isHighPriority=*/false, device_id));
         }
 
         // Warm up CUDA context and streams
@@ -249,6 +358,7 @@ void init_performance_resources(int io_threads = 0, size_t pinned_buffer_size_mb
         }
     }
 }
+
 
 
 // -------------------------------
@@ -302,6 +412,8 @@ torch::Tensor copy_gpu_tensors_to_buffer(
     const std::vector<int64_t>& block_ids_list,
     const c10::cuda::CUDAStream& stream) {
 
+    // Ensure we're on the same device as the source tensors
+    c10::cuda::CUDAGuard device_guard(src_tensors[0].device());
     auto dtype = src_tensors[0].dtype();
     size_t element_size = src_tensors[0].element_size();
 
@@ -331,14 +443,30 @@ torch::Tensor copy_gpu_tensors_to_buffer(
             auto block = tensor.index({torch::indexing::Slice(), block_id}).contiguous();
             size_t block_bytes = block.nbytes();
 
-            cudaMemcpyAsync(
-                static_cast<char*>(pinned_ptr) + offset,
-                block.data_ptr(),
-                block_bytes,
-                cudaMemcpyDeviceToHost,
-                stream.stream()
-            );
-
+            const char* env = std::getenv("USE_KERNEL_COPY_WRITE");
+            bool use_kernel_copy_write = (env && std::string(env) == "1");
+            if (!use_kernel_copy_write) { //Default behaviour
+                cudaMemcpyAsync(
+                    static_cast<char*>(pinned_ptr) + offset,
+                    block.data_ptr(),
+                    block_bytes,
+                    cudaMemcpyDeviceToHost,
+                    stream.stream()
+                );
+            } else {
+                // Experimental kernel path
+                char* dst_host = static_cast<char*>(pinned_ptr) + offset;
+                void* dst_mapped = nullptr;
+                // cudaHostGetDevicePointer requires current device matches target device
+                cudaError_t map_err = cudaHostGetDevicePointer(&dst_mapped, dst_host, 0);
+                if (map_err != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaHostGetDevicePointer failed: "
+                            << cudaGetErrorString(map_err) << "\n";
+                    throw std::runtime_error("cudaHostGetDevicePointer failed");
+                }
+                // Use GPU kernel to copy into mapped host memory
+                launch_memcpy_kernel(block.data_ptr(), dst_mapped, block_bytes, stream);
+            }
             offset += block_bytes;
         }
     }
@@ -376,7 +504,6 @@ bool write_file_to_disk(const std::string &target_path,
 
     ofs.write(reinterpret_cast<const char*>(data_ptr), nbytes);
     ofs.close();
-    // std::cout << "[INFO] Written " << nbytes << " bytes to temporary file: " << tmp_path << "\n";
     // Atomically rename temp file to final target name after successful write
     return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
 }
@@ -399,9 +526,13 @@ bool transfer_async_put_ext(int job_id,
 
         auto future = g_io_pool->enqueue([=, job_state = job_state.get()]() -> bool {
 
-          // Each thread gets a dedicated CUDA stream for async GPU ops.
+            // Ensure correct device is set (thread-local)
+            int device_id;
+            cudaGetDevice(&device_id);
+
+            // Each thread gets a dedicated CUDA stream for async GPU ops.
             if (!thread_stream.has_value()) {
-                thread_stream = g_streams[thread_stream_idx % g_streams.size()];
+                thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ false);;
             }
 
             // Save current CUDA stream so we can restore it later.
@@ -416,8 +547,7 @@ bool transfer_async_put_ext(int job_id,
                 cudaStreamSynchronize(thread_stream->stream());
 
                 // Stage 3: Write the pinned buffer to disk (blocking operation).
-                //bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
-                bool ok = write_file_to_disk(target, host_buf);
+                bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
 
                 if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
@@ -478,7 +608,6 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
     // Read into pinned memory
     ifs.read(reinterpret_cast<char*>(pinned_ptr), file_size);
     ifs.close();
-    //std::cout << "[INFO] 1/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
     // Wrap pinned buffer into a Torch tensor (CPU, pinned)
     auto options = torch::TensorOptions()
         .dtype(torch::kUInt8)  // raw bytes
@@ -492,7 +621,6 @@ torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
         [pinned_ptr](void* /*unused*/) {},
         options
     );
-    // std::cout << "[INFO] 2/2 Read file into pinned tensor: " << path << " (" << file_size << " bytes)\n";
     return tensor;
 }
 // Copy buffer to GPU tensors asynchronously using cudaMemcpyAsync (no swap_blocks)
@@ -510,8 +638,15 @@ bool copy_buffer_to_gpu_tensors(
     TORCH_CHECK(ref.is_contiguous(), "dst_tensors must be contiguous");
     TORCH_CHECK(cpu_buf.is_contiguous(), "cpu buffer must be contiguous");
 
+    // CRITICAL: Verify cpu_buf is pinned memory
+    TORCH_CHECK(cpu_buf.is_pinned(),
+        "cpu_buf must be pinned memory for kernel-based copy");
+
     const auto shape = ref.sizes();  // [2, num_blocks_total, H, B, D]
     TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
+
+    // Ensure we're on the same device as the destination tensors
+    c10::cuda::CUDAGuard device_guard(dst_tensors[0].device());
 
     const int64_t num_blocks_tot = shape[1];
     const int64_t H = shape[2];
@@ -547,24 +682,40 @@ bool copy_buffer_to_gpu_tensors(
             void* src_K = cpu_base + cpu_K_off;
             void* src_V = cpu_base + cpu_V_off;
 
+            const char* env = std::getenv("USE_KERNEL_COPY_READ");
+            bool use_kernel_copy_read = (!env || std::string(env) != "0");
+            if (use_kernel_copy_read) { //Default behaviour
+                // Replace cudaMemcpyAsync with kernel-based copy
+                launch_memcpy_kernel(src_K, dst_K, bytes_per_plane, stream);
+                launch_memcpy_kernel(src_V, dst_V, bytes_per_plane, stream);
+            } else {
+                // Standard cudaMemcpyAsync path
+                cudaError_t err1 = cudaMemcpyAsync(
+                    dst_K, src_K, bytes_per_plane,
+                    cudaMemcpyHostToDevice, stream.stream());
 
-            cudaError_t err1 = cudaMemcpyAsync(
-                dst_K, src_K, bytes_per_plane,
-                cudaMemcpyHostToDevice, stream.stream());
+                cudaError_t err2 = cudaMemcpyAsync(
+                    dst_V, src_V, bytes_per_plane,
+                    cudaMemcpyHostToDevice, stream.stream());
 
-            cudaError_t err2 = cudaMemcpyAsync(
-                dst_V, src_V, bytes_per_plane,
-                cudaMemcpyHostToDevice, stream.stream());
-
-            if (err1 != cudaSuccess || err2 != cudaSuccess) {
-                std::cerr << "[ERROR] cudaMemcpyAsync failed for block=" << gblock
-                          << " layer=" << layer
-                          << " err1=" << cudaGetErrorString(err1)
-                          << " err2=" << cudaGetErrorString(err2)
-                          << std::endl;
-                return false;
+                if (err1 != cudaSuccess || err2 != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaMemcpyAsync failed for block=" << gblock
+                              << " layer=" << layer
+                              << " err1=" << cudaGetErrorString(err1)
+                              << " err2=" << cudaGetErrorString(err2)
+                              << std::endl;
+                    return false;
+                }
             }
         }
+    }
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "[ERROR] Kernel launch failed: "
+                  << cudaGetErrorString(err) << std::endl;
+        return false;
     }
 
     return true;
@@ -591,6 +742,8 @@ bool transfer_async_get_ext(
             // Get dedicated stream for this thread
             if (!thread_stream.has_value()) {
                 thread_stream = g_streams[thread_stream_idx % g_streams.size()];
+                // thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ false);
+
             }
 
             // Save current CUDA stream so we can restore it later.
