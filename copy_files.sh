@@ -7,19 +7,19 @@ REMOTE_BASE="/workspace/vllm"
 FILES=(
 
   #Shared storage files
-  #"vllm/v1/offloading/worker/shared_storage.py"
-  #"vllm/v1/offloading/shared_storage.py"
-  #"tests/v1/offloading/test_shared_storage.py"
-  #"vllm/v1/offloading/shared_storage_manager.py"
-  # "vllm/v1/offloading/mediums.py"
+  # "vllm/v1/kv_offload/worker/shared_storage.py"
+  # "vllm/v1/kv_offload/shared_storage.py"
+  # "tests/v1/kv_offload/test_shared_storage.py"
+  # "vllm/v1/kv_offload/shared_storage_manager.py"
+  # "vllm/v1/kv_offload/mediums.py"
 
   # offloading
-  # "vllm/v1/offloading/worker/worker.py"
+  # "vllm/v1/kv_offload/worker/worker.py"
   #"vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py"
-  #"vllm/distributed/kv_transfer/kv_connector/factory.py"
+  # "vllm/v1/kv_offload/factory.py"
 
   # CPU
-  #"vllm/v1/offloading/worker/cpu.py"
+  #"vllm/v1/kv_offload/worker/cpu.py"
 
   # LMCACHE
   #vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
@@ -38,9 +38,9 @@ FILES=(
 
 
   # "vllm/v1/executor/multiproc_executor.py"
-  #"vllm/v1/offloading/cpu.py"
-  # "vllm/v1/offloading/spec.py"
-  # "vllm/v1/offloading/factory.py"
+  #"vllm/v1/kv_offload/cpu.py"
+  # "vllm/v1/kv_offload/spec.py"
+  # "vllm/v1/kv_offload/factory.py"
   # "vllm/attention/layer.py"
   #"vllm/distributed/kv_transfer/kv_connector/utils.py"
 )

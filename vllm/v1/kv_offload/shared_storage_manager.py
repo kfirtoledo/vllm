@@ -1,26 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import os
 import time
 import torch
 from pathlib import Path
-from collections import OrderedDict
-from collections import OrderedDict as OrderedDictType
+from collections.abc import Iterable
 from typing import Optional
-from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec
-from vllm.v1.offloading.abstract import (LoadStoreSpec, OffloadingManager,
-                                         PrepareStoreOutput,)
-from vllm.v1.offloading.worker.shared_storage import StorageOffloadingHandler
-from vllm.v1.offloading.lru_manager import BlockStatus
+
+from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_offload.mediums import SharedStorageLoadStoreSpec
+from vllm.v1.kv_offload.abstract import (
+    LoadStoreSpec,
+    OffloadingManager,
+    PrepareStoreOutput,
+)
+from vllm.v1.kv_offload.worker.shared_storage import StorageOffloadingHandler
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+
 class SharedStorageOffloadingManager(OffloadingManager):
     """
-    An SharedStorageOffloadingManager for managing offloading to shared storage.
+    SharedStorageOffloadingManager manages KV offloading to a shared storage medium.
     """
-    def __init__(self, model_name: str, tp_size: int, tp_rank: int, dtype: torch.dtype, root_dir: str = "/tmp/shared-kv") -> None:
+
+    def __init__(
+        self,
+        model_name: str,
+        tp_size: int,
+        tp_rank: int,
+        dtype: torch.dtype,
+        root_dir: str = "/tmp/shared-kv",
+    ) -> None:
         self.model_name = model_name
         self.tp_size = tp_size
         self.tp_rank = tp_rank
@@ -34,79 +47,71 @@ class SharedStorageOffloadingManager(OffloadingManager):
             root_dir=root_dir,
         )
 
-    def lookup(self, block_hashes: list[int]) -> int:
+    # ----------------------------------------------------------------------
+    # Lookup
+    # ----------------------------------------------------------------------
+    def lookup(self, block_hashes: Iterable[BlockHash]) -> int:
+        """Return how many consecutive blocks from the start are already offloaded."""
         hit_count = 0
         for block_hash in block_hashes:
-
             file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
             if not os.path.exists(file_path):
                 break
             hit_count += 1
         return hit_count
 
-    def prepare_load(self, block_hashes: list[int]) -> list[LoadStoreSpec]:
-        """
-        For shared storage, loading is stateless — return specs pointing to files.
-        """
-        specs: list[LoadStoreSpec] = []
+    # ----------------------------------------------------------------------
+    # Load
+    # ----------------------------------------------------------------------
+    def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
+        """For shared storage, loading is stateless - return specs pointing to files."""
+        return SharedStorageLoadStoreSpec(block_hashes)
 
-        for block_hash in block_hashes:
-            spec = SharedStorageLoadStoreSpec(block_hash=block_hash)
-            specs.append(spec)
-
-        return specs
-
-
-    def touch(self, block_ids: list[str]):
-        """
-        Update the access time of the files corresponding to the given block IDs.
-        """
+    def touch(self, block_hashes: Iterable[BlockHash]):
+        """Update access time for given block hashes."""
         now = time.time()
-        for block_id in block_ids:
-            path = StorageOffloadingHandler.get_file_name(self.base_path, block_id)
+        for block_hash in block_hashes:
+            path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
             try:
-                os.utime(path, (now, -1))  # Set atime to the current time (reading, opening, or executing the file).
+                os.utime(path, (now, -1))
             except FileNotFoundError:
                 pass
 
-    def complete_load(self, block_hashes: list[int]):
-        """
-        For shared storage, loading is stateless — no action needed.
-        """
-        pass
+    def complete_load(self, block_hashes: Iterable[BlockHash]):
+        """Stateless load - no post-load action needed."""
+        return
 
-
-    def prepare_store(self, block_hashes: list[int]) -> Optional[PrepareStoreOutput]:
+    # ----------------------------------------------------------------------
+    # Store
+    # ----------------------------------------------------------------------
+    def prepare_store(self, block_hashes: Iterable[BlockHash]) -> Optional[PrepareStoreOutput]:
         """
-        In shared storage, you can always store new blocks. No eviction required.
+        In shared storage, you can always store new blocks.
+        No eviction required.
         """
-        store_specs = []
-        block_hashes_to_store = []
+        block_hashes_to_store: list[BlockHash] = []
         for block_hash in block_hashes:
             file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
             if os.path.exists(file_path):
                 continue  # already stored
             block_hashes_to_store.append(block_hash)
-            store_specs.append(
-                SharedStorageLoadStoreSpec(
-                    block_hash=block_hash
-                )
-            )
+
+        # Set up store spec
+        store_spec = SharedStorageLoadStoreSpec(block_hashes_to_store)
 
         return PrepareStoreOutput(
             block_hashes_to_store=block_hashes_to_store,
-            store_specs=store_specs,
+            store_spec=store_spec,
             block_hashes_evicted=[],  # no eviction needed
         )
 
-    def complete_store(self, block_hashes: list[int], is_success: bool = True):
+    def complete_store(self, block_hashes: Iterable[BlockHash], success: bool = True):
         """
-        For shared storage, storing is stateless — no action needed.
+        For shared storage, storing is stateless - no action needed.
+        If storing failed, clean up partial files.
         """
-        if not is_success: # TODO- Check if this is needed
-            # If storing failed, need to clean up the files
+        if not success:
             for block_hash in block_hashes:
                 path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
                 if os.path.exists(path):
                     os.remove(path)
-        # Otherwise, files are already saved and no further action is needed.

@@ -55,5 +55,5 @@ OffloadingSpecFactory.register_spec(
 )
 
 OffloadingSpecFactory.register_spec("SharedStorageOffloadingSpec",
-                                    "vllm.v1.offloading.shared_storage",
+                                    "vllm.v1.kv_offload.shared_storage",
                                     "SharedStorageOffloadingSpec")

@@ -9,7 +9,7 @@ import storage_offload_ext
 
 
 from vllm.logger import init_logger
-from vllm.v1.offloading.worker.worker import OffloadingHandler, TransferSpec, TransferResult
+from vllm.v1.kv_offload.worker.worker import OffloadingHandler, TransferSpec, TransferResult
 
 logger = init_logger(__name__)
 
@@ -56,6 +56,8 @@ class StorageOffloadingHandler(OffloadingHandler):
     @staticmethod
     def get_file_name(base_path: Path, block_hash: int) -> Path:
         """Return file path for a given block hash."""
+        if isinstance(block_hash, bytes): # convert bytes to int
+            block_hash = int.from_bytes(block_hash, "little")
         block_hash_hex = f"{block_hash & ((1 << 64) - 1):016x}"
         subfolder1, subfolder2 = block_hash_hex[:8], block_hash_hex[8:16]
         full_path = base_path / subfolder1 / subfolder2 / f"{block_hash_hex}.bin"
@@ -122,19 +124,19 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
         """Launch async PUT transfers from GPU tensors to files.
         Prepare arrays containing file paths, GPU block IDs to copy, and the list of GPU tensors."""
         #time_start = time.time()
-        src_specs, dst_specs = spec
-        if not dst_specs:
+        src_spec, dst_spec = spec
+        if dst_spec is None or len(dst_spec.block_hashes) == 0:
             return True
 
         target_files    = []
         all_block_ids   = []
-        for i, dst_spec in enumerate(dst_specs):
+        for i, block_hash in enumerate(dst_spec.block_hashes):
             start = i * self.gpu_blocks_per_file
-            end = min((i + 1) * self.gpu_blocks_per_file, len(src_specs))
-            if start >= len(src_specs):
+            end = min((i + 1) * self.gpu_blocks_per_file, len(src_spec.block_ids))
+            if start >= len(src_spec.block_ids):
                 break
-            block_ids = [src_specs[j].block_id for j in range(start, end)]
-            target_file = str(self.get_file_name(self.base_path, dst_spec.block_hash))
+            block_ids = src_spec.block_ids[start:end]
+            target_file = str(self.get_file_name(self.base_path, block_hash))
             target_files.append(target_file)
             all_block_ids.append(block_ids)
             #print(f"[DEBUG PUT] dst_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
@@ -162,24 +164,24 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         """Launch async GET transfers from files to GPU tensors,
         preparing arrays of file paths, block IDs, and tensors."""
-        src_specs, dst_specs = spec
-        if not src_specs:
+        src_spec, dst_spec = spec
+        if src_spec is None or len(src_spec.block_hashes) == 0:
             return True
 
         source_files = []
         all_block_ids = []
-        first_len = len(dst_specs) % self.gpu_blocks_per_file or self.gpu_blocks_per_file
+        first_len = len(dst_spec.block_ids) % self.gpu_blocks_per_file or self.gpu_blocks_per_file
         start = 0
-        for i, src_spec in enumerate(src_specs):
+        for i, block_hash in enumerate(src_spec.block_hashes):
             if i == 0:
                 size = first_len
             else:
                 size = self.gpu_blocks_per_file
 
-            end = min(start + size, len(dst_specs))
-            block_ids = [dst.block_id for dst in dst_specs[start:end]]
+            end = min(start + size, len(dst_spec.block_ids))
+            block_ids = dst_spec.block_ids[start:end]
             #print(f"[DEBUG GET] src_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
-            source_files.append(str(self.get_file_name(self.base_path, src_spec.block_hash)))
+            source_files.append(str(self.get_file_name(self.base_path, block_hash)))
             all_block_ids.append(block_ids)
             start += size
 

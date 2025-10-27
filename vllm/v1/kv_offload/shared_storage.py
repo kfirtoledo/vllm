@@ -6,19 +6,19 @@ from collections.abc import Iterator
 from typing import Optional
 
 from vllm.config import VllmConfig
-from vllm.v1.offloading.abstract import LoadStoreSpec, OffloadingManager
-from vllm.v1.offloading.mediums import GPULoadStoreSpec, SharedStorageLoadStoreSpec
-from vllm.v1.offloading.shared_storage_manager import SharedStorageOffloadingManager
-from vllm.v1.offloading.spec import OffloadingSpec
+from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
+from vllm.v1.kv_offload.mediums import GPULoadStoreSpec, SharedStorageLoadStoreSpec
+from vllm.v1.kv_offload.shared_storage_manager import SharedStorageOffloadingManager
+from vllm.v1.kv_offload.spec import OffloadingSpec
 
-from vllm.v1.offloading.worker.shared_storage import (
+from vllm.v1.kv_offload.worker.shared_storage import (
     GPUStorageOffloadingHandler,
     StorageGPUOffloadingHandler,
     DEFAULT_MAX_PINNED_MEMORY_GB,
     DEFAULT_MAX_THREADS_PER_GPU
 )
 
-from vllm.v1.offloading.worker.worker import OffloadingHandler
+from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
 class SharedStorageOffloadingSpec(OffloadingSpec):

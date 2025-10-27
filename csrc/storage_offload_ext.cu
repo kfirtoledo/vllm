@@ -39,18 +39,18 @@ namespace py = pybind11;
     } while (0)
 
 // Timing macro - measures only if STORAGE_CONNECTOR_DEBUG is not "0"
-#define TIME_EXPR(label, expr) ([&]() {                                      \
-    const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");                \
-    if (!(env && std::string(env) == "1"))  {                                   \
-        /* Debug disabled: just execute expression */                        \
-        return (expr);                                                       \
-    }                                                                        \
-    auto __t0 = std::chrono::high_resolution_clock::now();                   \
-    auto __ret = (expr);                                                     \
-    auto __t1 = std::chrono::high_resolution_clock::now();                   \
-    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count(); \
-    std::cout << "[DEBUG][TIME] " << label << " took " << __ms << " ms\n";          \
-    return __ret;                                                            \
+#define TIME_EXPR(label, expr, info_str) ([&]() {                                  \
+    const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");                      \
+    if (!(env && std::string(env) == "1")) {                                       \
+        return (expr);                                                             \
+    }                                                                              \
+    auto __t0 = std::chrono::high_resolution_clock::now();                         \
+    auto __ret = (expr);                                                           \
+    auto __t1 = std::chrono::high_resolution_clock::now();                         \
+    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();  \
+    std::cout << "[DEBUG][TIME] " << label << " took " << __ms << " ms | "         \
+              << info_str << std::endl;                                            \
+    return __ret;                                                                  \
 })()
 
 // -------------------------------------
@@ -89,7 +89,7 @@ static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
             t_pinned_size = alloc_size;
             DEBUG_PRINT("[INFO] Thread " << std::this_thread::get_id()
                       << " allocated pinned buffer "
-                      << (alloc_size / (1024 * 1024)) << " MB\n");
+                      << (alloc_size / (1024 * 1024)) << " MB");
         }
     }
     return {t_pinned_ptr, t_pinned_size};
@@ -229,15 +229,15 @@ public:
         // Initialize PyTorch threading globally (main thread only)
         at::init_num_threads();
         at::set_num_threads(1);
-
+        int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);  // number of available logical CPUs
         for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank, device_id] {
+            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank, device_id, num_cpus] {
 
                 // Set CUDA device for this thread FIRST
                 cudaSetDevice(device_id);
 
                 // Compute unique CPU per thread
-                int cpu_id = tp_rank * threads + i;
+                int cpu_id = (tp_rank * threads + i) % num_cpus;
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
                 CPU_SET(cpu_id, &cpuset);
@@ -254,7 +254,7 @@ public:
                           << " set CUDA device to " << device_id
                           << " (tid=" << tid << ", tp_rank=" << tp_rank
                           << ") pinned to CPU " << cpu_id
-                          << " (running on CPU " << actual_cpu << ")\n");
+                          << " (running on CPU " << actual_cpu << ")");
 
                 // Attach preallocated pinned buffer
                 if (i < g_pinned_buffers.size() && g_pinned_buffers[i].ptr != nullptr) {
@@ -547,7 +547,9 @@ bool transfer_async_put_ext(int job_id,
                 cudaStreamSynchronize(thread_stream->stream());
 
                 // Stage 3: Write the pinned buffer to disk (blocking operation).
-                bool ok = TIME_EXPR("write_file_to_disk", write_file_to_disk(target, host_buf));
+                bool ok = TIME_EXPR("write_file_to_disk ", write_file_to_disk(target, host_buf),
+                  ("file:" + target + " size:" + std::to_string(host_buf.nbytes()))
+                );
 
                 if (!ok)
                     std::cerr << "[ERROR] PUT failed during file write: " << target << "\n";
@@ -757,8 +759,9 @@ bool transfer_async_get_ext(
             torch::Tensor host_buf;
             try {
                 // Read data from disk into pinned memory tensor.
-                //host_buf = read_file_to_pinned_tensor(src_file);
-                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file));
+                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file),
+                    ("file:" + src_file)
+                );
                 stage1_ok = true;
             } catch (const std::exception& e) {
                 std::cerr << "[ERROR] Stage1 read_file_to_pinned_tensor failed for "

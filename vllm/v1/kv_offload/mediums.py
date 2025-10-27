@@ -3,7 +3,8 @@
 from abc import ABC
 
 import numpy as np
-
+from typing import Iterable
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import LoadStoreSpec
 
 
@@ -37,15 +38,26 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @staticmethod
     def medium() -> str:
         return "CPU"
-
 class SharedStorageLoadStoreSpec(LoadStoreSpec):
     """
-    Spec for loading/storing a KV block to Shared storage.
+    Spec for loading/storing KV blocks on shared storage.
+
+    Accepts a collection of BlockHash values (ints or np.uint64).
+    Stores them internally as np.ndarray(dtype=np.uint64).
     """
 
+    def __init__(self, block_hashes: Iterable[BlockHash]):
+        # Validate all items are bytes (BlockHash)
+        block_hashes = list(block_hashes)
+        for h in block_hashes:
+            if not isinstance(h, (bytes, bytearray)):
+                raise TypeError(f"Expected BlockHash (bytes), got {type(h)}")
 
-    def __init__(self, block_hash: int):
-        self.block_hash = block_hash
+        # Store directly as object array of bytes
+        self.block_hashes = np.array(block_hashes, dtype=object)
+
+    def __repr__(self) -> str:
+        return repr(self.block_hashes)
 
     @staticmethod
     def medium() -> str:

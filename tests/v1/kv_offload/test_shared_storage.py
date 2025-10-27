@@ -6,13 +6,14 @@ import struct
 import xxhash
 import torch
 import pytest
+from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm.v1.offloading.worker.shared_storage import (
+from vllm.v1.kv_offload.worker.shared_storage import (
     StorageOffloadingHandler,
     GPUStorageOffloadingHandler,
     StorageGPUOffloadingHandler,
 )
-from vllm.v1.offloading.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.mediums import SharedStorageLoadStoreSpec, GPULoadStoreSpec
 
 TMP_DIR = "/tmp/shared-kv-test"
 
@@ -31,17 +32,19 @@ def get_prefix_hash(token_ids):
     buf = bytearray()
     for t in token_ids:
         buf += struct.pack("<I", int(t) & 0xFFFFFFFF)
-    return xxhash.xxh64(buf).intdigest()
+    digest_int = xxhash.xxh64(buf).intdigest()
+    # Convert 64-bit int to 8-byte little-endian representation
+    return BlockHash((digest_int & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
 
 def make_gpu_specs(block_ids):
     """Create GPULoadStoreSpec objects for the given block IDs."""
-    return [GPULoadStoreSpec(block_id=int(b)) for b in block_ids]
+    return GPULoadStoreSpec(block_ids)
 
 def make_storage_specs(num_files: int):
     """Create SharedStorageLoadStoreSpec objects and their hashes for a given number of files."""
     ranges = [(100 + i * 100, 117 + i * 100) for i in range(num_files)]
     hashes = [get_prefix_hash(range(a, b)) for (a, b) in ranges]
-    return [SharedStorageLoadStoreSpec(block_hash=h) for h in hashes], hashes
+    return SharedStorageLoadStoreSpec(hashes), hashes
 
 def cleanup_files(model_name, tp_size, tp_rank, dtype, root_dir, block_hashes):
     """Remove existing files for the provided block hashes."""
@@ -136,11 +139,11 @@ def roundtrip_once(*, model_name: str, tp_size: int, tp_rank: int, dtype: torch.
         root_dir=root_dir,
     )
     start_get = time.time()
-    read_gpu_specs = make_gpu_specs(read_block_ids)
+    get_gpu_specs = make_gpu_specs(read_block_ids)
     get_num_files = math.ceil(len(read_block_ids) / group_size)
-    start_index = len(put_storage_specs) - get_num_files
-    get_storage_specs = put_storage_specs[start_index:]
-    get_handler.transfer_async(job_id=2, spec=(get_storage_specs, read_gpu_specs))
+    start_index = len(put_storage_specs.block_hashes) - get_num_files
+    get_storage_spec = SharedStorageLoadStoreSpec(put_storage_specs.block_hashes[start_index:])
+    get_handler.transfer_async(job_id=2, spec=(get_storage_spec, get_gpu_specs))
     ok_get = wait_for(get_handler, job_id=2, timeout=2.0)
     dur_get = time.time() - start_get
     assert ok_get, "GET failed"
