@@ -196,6 +196,7 @@ inline void launch_memcpy_kernel(
     // Compute number of blocks to cover all data; limit to 1024 for practicality
     int blocks = std::min((int)((bytes + threads - 1) / threads), 1024);
 
+    // Each block contains 256 threads; launch up to 1024 blocks (≈262K threads total)
     memcpy_kernel<<<blocks, threads, 0, stream.stream()>>>(
         static_cast<const char*>(src),
         static_cast<char*>(dst),
@@ -412,63 +413,117 @@ torch::Tensor copy_gpu_tensors_to_buffer(
     const std::vector<int64_t>& block_ids_list,
     const c10::cuda::CUDAStream& stream) {
 
+    TORCH_CHECK(!src_tensors.empty(), "Source tensors list is empty");
+    const auto& ref = src_tensors[0];
+    TORCH_CHECK(ref.is_contiguous(), "src_tensors must be contiguous");
+
+    const auto shape = ref.sizes();  // [2, num_blocks_total, H, B, D]
+    TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
+
     // Ensure we're on the same device as the source tensors
-    c10::cuda::CUDAGuard device_guard(src_tensors[0].device());
-    auto dtype = src_tensors[0].dtype();
-    size_t element_size = src_tensors[0].element_size();
+    // c10::cuda::CUDAGuard device_guard(src_tensors[0].device());
 
-    // Calculate dimensions
-    size_t total_elements = 0;
-    for (int64_t block_id : block_ids_list) {
-        for (const auto &tensor : src_tensors) {
-            auto block = tensor.index({torch::indexing::Slice(), block_id});
-            total_elements += block.numel();
-        }
-    }
+    const int64_t num_blocks_tot = shape[1];
+    const int64_t H = shape[2];  //H: number of attention heads
+    const int64_t B = shape[3]; // B: number of tokens per block (block size)
+    const int64_t D = shape[4]; // D: head dimension
+    const int num_layers = static_cast<int>(src_tensors.size());
 
-    size_t required_bytes = total_elements * element_size;
-    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(required_bytes);
+    const size_t elem_size = ref.element_size();
+    const size_t bytes_per_plane = static_cast<size_t>(H * B * D) * elem_size;
+    const size_t bytes_per_block = 2 * bytes_per_plane;  // [K,V]
+
+    // Calculate total size needed
+    const size_t total_bytes = block_ids_list.size() * num_layers * bytes_per_block;
+
+    auto [pinned_ptr, pinned_size] = get_thread_local_pinned(total_bytes);
+    TORCH_CHECK(pinned_size >= total_bytes,
+        "Pinned buffer too small: need ", total_bytes, " got ", pinned_size);
+
+    auto dtype = ref.dtype();
+    const int64_t total_elements = static_cast<int64_t>(total_bytes / elem_size);
 
     // Create output tensor view
     torch::Tensor result_cpu = torch::from_blob(
-        pinned_ptr,
-        {static_cast<long>(total_elements)},
+        pinned_ptr, {total_elements},
         torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true)
     );
 
-    // Direct async copy without intermediate cat
-    size_t offset = 0;
-    for (int64_t block_id : block_ids_list) {
-        for (const auto &tensor : src_tensors) {
-            auto block = tensor.index({torch::indexing::Slice(), block_id}).contiguous();
-            size_t block_bytes = block.nbytes();
+    auto* cpu_base = static_cast<uint8_t*>(pinned_ptr);
+
+    // Direct pointer arithmetic - NO INDEXING operations
+    for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+        const int64_t gblock = block_ids_list[bi];
+        const size_t cpu_block_base = bi * num_layers * bytes_per_block;
+
+        for (int layer = 0; layer < num_layers; ++layer) {
+            const auto& layer_tensor = src_tensors[layer];
+            auto* src_base = reinterpret_cast<const uint8_t*>(layer_tensor.data_ptr());
+
+            // Compute GPU source offsets for K and V
+            const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
+            const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
+
+            // Compute CPU destination offsets for K and V
+            const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
+            const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
+
+            const void* src_K = src_base + gpu_K_off;
+            const void* src_V = src_base + gpu_V_off;
+            void* dst_K = cpu_base + cpu_K_off;
+            void* dst_V = cpu_base + cpu_V_off;
 
             const char* env = std::getenv("USE_KERNEL_COPY_WRITE");
             bool use_kernel_copy_write = (env && std::string(env) == "1");
-            if (!use_kernel_copy_write) { //Default behaviour
-                cudaMemcpyAsync(
-                    static_cast<char*>(pinned_ptr) + offset,
-                    block.data_ptr(),
-                    block_bytes,
-                    cudaMemcpyDeviceToHost,
-                    stream.stream()
-                );
+
+            if (!use_kernel_copy_write) {
+                // Default behavior: Standard cudaMemcpyAsync path
+                cudaError_t err1 = cudaMemcpyAsync(
+                    dst_K, src_K, bytes_per_plane,
+                    cudaMemcpyDeviceToHost, stream.stream());
+
+                cudaError_t err2 = cudaMemcpyAsync(
+                    dst_V, src_V, bytes_per_plane,
+                    cudaMemcpyDeviceToHost, stream.stream());
+
+                if (err1 != cudaSuccess || err2 != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaMemcpyAsync failed for block=" << gblock
+                              << " layer=" << layer
+                              << " err1=" << cudaGetErrorString(err1)
+                              << " err2=" << cudaGetErrorString(err2)
+                              << std::endl;
+                    TORCH_CHECK(false, "cudaMemcpyAsync failed");
+                }
             } else {
                 // Experimental kernel path
-                char* dst_host = static_cast<char*>(pinned_ptr) + offset;
-                void* dst_mapped = nullptr;
-                // cudaHostGetDevicePointer requires current device matches target device
-                cudaError_t map_err = cudaHostGetDevicePointer(&dst_mapped, dst_host, 0);
-                if (map_err != cudaSuccess) {
-                    std::cerr << "[ERROR] cudaHostGetDevicePointer failed: "
-                            << cudaGetErrorString(map_err) << "\n";
-                    throw std::runtime_error("cudaHostGetDevicePointer failed");
+                void* dst_K_mapped = nullptr;
+                void* dst_V_mapped = nullptr;
+
+                cudaError_t map_err1 = cudaHostGetDevicePointer(&dst_K_mapped, dst_K, 0);
+                cudaError_t map_err2 = cudaHostGetDevicePointer(&dst_V_mapped, dst_V, 0);
+
+                if (map_err1 != cudaSuccess || map_err2 != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaHostGetDevicePointer failed for block=" << gblock
+                              << " layer=" << layer
+                              << " err1=" << cudaGetErrorString(map_err1)
+                              << " err2=" << cudaGetErrorString(map_err2)
+                              << std::endl;
+                    TORCH_CHECK(false, "cudaHostGetDevicePointer failed");
                 }
+
                 // Use GPU kernel to copy into mapped host memory
-                launch_memcpy_kernel(block.data_ptr(), dst_mapped, block_bytes, stream);
+                launch_memcpy_kernel(src_K, dst_K_mapped, bytes_per_plane, stream);
+                launch_memcpy_kernel(src_V, dst_V_mapped, bytes_per_plane, stream);
             }
-            offset += block_bytes;
         }
+    }
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "[ERROR] Kernel launch failed: "
+                  << cudaGetErrorString(err) << std::endl;
+        TORCH_CHECK(false, "Kernel launch failed");
     }
 
     if (result_cpu.dtype() == torch::kBFloat16) {
@@ -518,21 +573,29 @@ bool transfer_async_put_ext(int job_id,
     auto job_state = std::make_unique<JobState>();
     job_state->total_tasks = target_files.size();
 
+    // Store shared_ptr to tensors to avoid repeated refcount changes
+    auto shared_src_tensors= std::make_shared<std::vector<torch::Tensor>>(std::move(src_tensors));
+
     // For each target file, enqueue one async task in the I/O thread pool.
     for (size_t i = 0; i < target_files.size(); i++) {
         std::string target = target_files[i];
-        auto src = src_tensors;
         auto bids = all_block_ids[i];
 
-        auto future = g_io_pool->enqueue([=, job_state = job_state.get()]() -> bool {
+        auto future = g_io_pool->enqueue([target, bids, shared_src_tensors, job_state = job_state.get()]() -> bool {
 
+            // Check if target file already exists - skip write if it does
+            if (std::ifstream(target).good()) {
+                job_state->completed_tasks.fetch_add(1);
+                return true;  // File exists
+            }
             // Ensure correct device is set (thread-local)
             int device_id;
             cudaGetDevice(&device_id);
 
             // Each thread gets a dedicated CUDA stream for async GPU ops.
             if (!thread_stream.has_value()) {
-                thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ false);;
+                //thread_stream = g_streams[thread_stream_idx % g_streams.size()];
+                thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ false); // use best-effort stream for writes
             }
 
             // Save current CUDA stream so we can restore it later.
@@ -540,13 +603,18 @@ bool transfer_async_put_ext(int job_id,
             at::cuda::setCurrentCUDAStream(*thread_stream);
 
             try {
+                // Use reference to avoid copy - dereference shared_ptr
+                const auto& src = *shared_src_tensors;
+
                 // Stage 1: Asynchronously copy tensors from GPU to pinned CPU buffer.
                 auto host_buf = copy_gpu_tensors_to_buffer(src, bids, *thread_stream);
 
-                // Stage 2: Synchronize only this thread's CUDA stream (not all).
-                cudaStreamSynchronize(thread_stream->stream());
-
-                // Stage 3: Write the pinned buffer to disk (blocking operation).
+                cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
+                if (err != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaStreamSynchronize failed: "
+                            << cudaGetErrorString(err) << std::endl;
+                }
+                // Stage 2: Write the pinned buffer to disk (blocking operation).
                 bool ok = TIME_EXPR("write_file_to_disk ", write_file_to_disk(target, host_buf),
                   ("file:" + target + " size:" + std::to_string(host_buf.nbytes()))
                 );
@@ -570,7 +638,6 @@ bool transfer_async_put_ext(int job_id,
                 return false;
             }
         });
-
         // Convert std::future → std::shared_future- is copyable and can be waited on by multiple threads.
         job_state->futures.push_back(future.share());
     }
@@ -651,12 +718,13 @@ bool copy_buffer_to_gpu_tensors(
     c10::cuda::CUDAGuard device_guard(dst_tensors[0].device());
 
     const int64_t num_blocks_tot = shape[1];
-    const int64_t H = shape[2];
-    const int64_t B = shape[3];
-    const int64_t D = shape[4];
+    const int64_t H = shape[2];  //H: number of attention heads
+    const int64_t B = shape[3]; // B: number of tokens per block (block size)
+    const int64_t D = shape[4]; // D: head dimension
     const int num_layers = static_cast<int>(dst_tensors.size());
 
-    const size_t elem_size = ref.element_size();
+    const size_t elem_size = ref.element_size(); // Size (in bytes) of a single element (e.g., 2 for float16, 4 for float32)
+
     const size_t bytes_per_plane = static_cast<size_t>(H * B * D) * elem_size;
     const size_t bytes_per_block = 2 * bytes_per_plane;  // [K,V] in CPU buf
 
@@ -744,8 +812,6 @@ bool transfer_async_get_ext(
             // Get dedicated stream for this thread
             if (!thread_stream.has_value()) {
                 thread_stream = g_streams[thread_stream_idx % g_streams.size()];
-                // thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ false);
-
             }
 
             // Save current CUDA stream so we can restore it later.
@@ -786,7 +852,6 @@ bool transfer_async_get_ext(
                                 << cudaGetErrorString(err) << std::endl;
                         ok = false;
                     }
-
                 } catch (const std::exception& e) {
                     std::cerr << "[ERROR] Stage2 copy_and_swap failed for " << src_file
                             << ": " << e.what() << std::endl;
