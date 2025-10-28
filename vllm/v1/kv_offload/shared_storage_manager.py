@@ -69,13 +69,14 @@ class SharedStorageOffloadingManager(OffloadingManager):
 
     def touch(self, block_hashes: Iterable[BlockHash]):
         """Update access time for given block hashes."""
-        now = time.time()
-        for block_hash in block_hashes:
-            path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
-            try:
-                os.utime(path, (now, -1))
-            except FileNotFoundError:
-                pass
+        # now = time.time()
+        # for block_hash in block_hashes:
+        #     path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
+        #     try:
+        #         os.utime(path, (now, -1))
+        #     except FileNotFoundError:
+        #         pass
+        return
 
     def complete_load(self, block_hashes: Iterable[BlockHash]):
         """Stateless load - no post-load action needed."""
@@ -91,9 +92,9 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         block_hashes_to_store: list[BlockHash] = []
         for block_hash in block_hashes:
-            file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
-            if os.path.exists(file_path):
-                continue  # already stored
+            # file_path = StorageOffloadingHandler.get_file_name(self.base_path, block_hash)
+            # if os.path.exists(file_path):
+            #     continue  # already stored
             block_hashes_to_store.append(block_hash)
 
         # Set up store spec
