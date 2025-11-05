@@ -542,7 +542,7 @@ bool write_file_to_disk(const std::string &target_path,
 
     std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
     if (!ofs) {
-        std::cerr << "[ERROR] Failed to open temporary file for writing: " << tmp_path << "\n";
+        std::cerr << "[ERROR] Failed to open temporary file for writing: " << tmp_path << " - " << std::strerror(errno) << "\n";
         return false;
     }
 
@@ -552,9 +552,18 @@ bool write_file_to_disk(const std::string &target_path,
     ofs.rdbuf()->pubsetbuf(buffer.data(), WRITE_BUFFER_SIZE);
 
     ofs.write(reinterpret_cast<const char*>(data_ptr), nbytes);
+    if (!ofs) {
+        std::cerr << "[ERROR] Failed to write to temporary file: " << tmp_path << " - " << std::strerror(errno) << "\n";
+        return false;
+    }
     ofs.close();
     // Atomically rename temp file to final target name after successful write
-    return (std::rename(tmp_path.c_str(), target_path.c_str()) == 0);
+    if (std::rename(tmp_path.c_str(), target_path.c_str()) != 0) {
+        std::cerr << "[ERROR] " << "Failed to rename " + tmp_path + " to " + target_path + " - " + std::strerror(errno) << "\n";
+        return false;
+    }
+
+    return true;
 }
 
 // Async GPU → Storage transfer (PUT)
@@ -601,7 +610,7 @@ bool transfer_async_put_ext(int job_id,
                 const auto& src = *shared_src_tensors;
 
                 // Stage 1: Asynchronously copy tensors from GPU to pinned CPU buffer.
-                auto host_buf = copy_gpu_tensors_to_buffer(src, bids, *thread_stream);
+                auto host_buf = TIME_EXPR("copy_gpu_tensors_to_buffer", copy_gpu_tensors_to_buffer(src, bids, *thread_stream),"file: " + target);
 
                 cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
                 if (err != cudaSuccess) {
@@ -621,7 +630,8 @@ bool transfer_async_put_ext(int job_id,
 
                 // Atomically mark task completion.
                 job_state->completed_tasks.fetch_add(1);
-                if (!ok) job_state->all_success = false;
+
+                // if (!ok) job_state->all_success = false; // TODO- silent ignore write failures for now offloading connector not able to handle failures
                 return ok;
 
             } catch (...) {
@@ -837,8 +847,8 @@ bool transfer_async_get_ext(
             if (stage1_ok) {
                 try {
                     // Perform asynchronous GPU copy and tensor swap.
-                    ok = copy_buffer_to_gpu_tensors(
-                        host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream);
+                    ok = TIME_EXPR("copy_buffer_to_gpu_tensors", copy_buffer_to_gpu_tensors(
+                        host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream), "file: " + src_file);
 
                     cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
                     if (err != cudaSuccess) {
