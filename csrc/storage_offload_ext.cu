@@ -25,7 +25,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <filesystem>
 
+namespace fs = std::filesystem;
 namespace py = pybind11;
 // -------------------------------------
 // Debugging and timing macros
@@ -534,6 +536,18 @@ bool write_file_to_disk(const std::string &target_path,
     const void* data_ptr = host_buf.data_ptr();
     // Get total number of bytes to write
     size_t nbytes = host_buf.nbytes();
+
+    // Extract and create parent directory
+    fs::path file_path(target_path);
+    fs::path parent_dir = file_path.parent_path();
+    try {
+        fs::create_directories(parent_dir);
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "[ERROR] Failed to create directories: "
+                  << e.what() << "\n";
+        return false;
+    }
+
     // Write first to a temporary file to ensure atomic rename later
     std::string tmp_path = target_path + ".tmp";
 

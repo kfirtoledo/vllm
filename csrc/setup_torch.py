@@ -9,7 +9,7 @@ setup(
             ["storage_offload_ext.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17", "-fopenmp"],
-                "nvcc": ["-O3", "-std=c++17"]
+                "nvcc": ["-O3", "-std=c++17", "-Xcompiler", "-std=c++17","-Xcompiler", "-fopenmp"]
             }
         ),
     ],
