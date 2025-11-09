@@ -624,7 +624,7 @@ bool transfer_async_put_ext(int job_id,
                 const auto& src = *shared_src_tensors;
 
                 // Stage 1: Asynchronously copy tensors from GPU to pinned CPU buffer.
-                auto host_buf = TIME_EXPR("copy_gpu_tensors_to_buffer", copy_gpu_tensors_to_buffer(src, bids, *thread_stream),"file: " + target);
+                auto host_buf = TIME_EXPR("write phase 1: copy_gpu_tensors_to_buffer", copy_gpu_tensors_to_buffer(src, bids, *thread_stream),"file: " + target);
 
                 cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
                 if (err != cudaSuccess) {
@@ -632,7 +632,7 @@ bool transfer_async_put_ext(int job_id,
                             << cudaGetErrorString(err) << std::endl;
                 }
                 // Stage 2: Write the pinned buffer to disk (blocking operation).
-                bool ok = TIME_EXPR("write_file_to_disk ", write_file_to_disk(target, host_buf),
+                bool ok = TIME_EXPR("write phase 2: write_file_to_disk", write_file_to_disk(target, host_buf),
                   ("file:" + target + " size:" + std::to_string(host_buf.nbytes()))
                 );
 
@@ -670,7 +670,7 @@ bool transfer_async_put_ext(int job_id,
 // ----------------------------------------------------------------------
 
 // Read a file into a pinned CPU tensor from the pool
-torch::Tensor read_file_to_pinned_tensor(const std::string& path) {
+torch::Tensor read_file_from_disk(const std::string& path) {
 
     // Open file
     std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
@@ -843,12 +843,12 @@ bool transfer_async_get_ext(
             torch::Tensor host_buf;
             try {
                 // Read data from disk into pinned memory tensor.
-                host_buf = TIME_EXPR("read_file_to_pinned_tensor", read_file_to_pinned_tensor(src_file),
+                host_buf = TIME_EXPR("read phase 1: read_file_from_disk", read_file_from_disk(src_file),
                     ("file:" + src_file)
                 );
                 stage1_ok = true;
             } catch (const std::exception& e) {
-                std::cerr << "[ERROR] Stage1 read_file_to_pinned_tensor failed for "
+                std::cerr << "[ERROR] Stage1 read_file_from_disk failed for "
                         << src_file << ": " << e.what() << std::endl;
             } catch (...) {
                 std::cerr << "[ERROR] Stage1 unknown failure for " << src_file << std::endl;
@@ -861,7 +861,7 @@ bool transfer_async_get_ext(
             if (stage1_ok) {
                 try {
                     // Perform asynchronous GPU copy and tensor swap.
-                    ok = TIME_EXPR("copy_buffer_to_gpu_tensors", copy_buffer_to_gpu_tensors(
+                    ok = TIME_EXPR("read phase 2: copy_buffer_to_gpu_tensors", copy_buffer_to_gpu_tensors(
                         host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream), "file: " + src_file);
 
                     cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
