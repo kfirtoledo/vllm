@@ -5,7 +5,7 @@ import os
 import torch
 from pathlib import Path
 import time
-import storage_offload_ext
+import storage_offload
 
 
 from vllm.logger import init_logger
@@ -77,11 +77,11 @@ class StorageOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         """Poll finished async transfers."""
-        return storage_offload_ext.get_finished_ext()
+        return storage_offload.get_finished_ext()
 
     def __del__(self):
         """Cleanup performance resources on destruction."""
-        storage_offload_ext.cleanup_performance_resources()
+        storage_offload.cleanup_performance_resources()
 
 
 # ----------------------------------------------------------------------
@@ -103,7 +103,7 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
                   f" (buffer_size_mb={self.buffer_size_mb}).")
 
         # TODO set different init for each class
-        storage_offload_ext.init_performance_resources(
+        storage_offload.init_performance_resources(
             io_threads=self.threads_per_gpu,
             pinned_buffer_size_mb=self.buffer_size_mb,
             max_pinned_memory_gb=self.max_pinned_memory_gb,
@@ -142,7 +142,7 @@ class GPUStorageOffloadingHandler(StorageOffloadingHandler):
             #print(f"[DEBUG PUT] dst_spec {i}: len block_ids={len(block_ids)} block_ids={block_ids}")
         stream = self.h2d_stream # TODO- check if needed
         with torch.cuda.stream(stream):
-            storage_offload_ext.transfer_async_put_ext(
+            storage_offload.transfer_async_put_ext(
                 job_id, target_files, self.src_tensors, all_block_ids )
         #print(f"Total PUT job {job_id} setup time: {time.time()-time_start:.6f} sec")
 
@@ -187,7 +187,7 @@ class StorageGPUOffloadingHandler(StorageOffloadingHandler):
 
         stream = self.d2h_stream # TODO- check if needed
         with torch.cuda.stream(stream):
-            storage_offload_ext.transfer_async_get_ext(
+            storage_offload.transfer_async_get_ext(
                 job_id,
                 source_files,
                 all_block_ids,

@@ -26,104 +26,13 @@
 #include <fcntl.h>
 #include <cstring>
 #include <filesystem>
+#include <numa.h>
+
+#include "thread_pool.cpp"
+#include "debug_utils.cpp"
 
 namespace fs = std::filesystem;
 namespace py = pybind11;
-// -------------------------------------
-// Debugging and timing macros
-// -------------------------------------
-
-#define DEBUG_PRINT(msg)                                                     \
-    do {                                                                     \
-        const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");            \
-        if (env && std::string(env) != "0")                                 \
-            std::cout << "[DEBUG] " << msg << std::endl;                     \
-    } while (0)
-
-// Timing macro - measures only if STORAGE_CONNECTOR_DEBUG is not "0"
-#define TIME_EXPR(label, expr, info_str) ([&]() {                                  \
-    const char* env = std::getenv("STORAGE_CONNECTOR_DEBUG");                      \
-    if (!(env && std::string(env) == "1")) {                                       \
-        return (expr);                                                             \
-    }                                                                              \
-    auto __t0 = std::chrono::high_resolution_clock::now();                         \
-    auto __ret = (expr);                                                           \
-    auto __t1 = std::chrono::high_resolution_clock::now();                         \
-    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();  \
-    std::cout << "[DEBUG][TIME] " << label << " took " << __ms << " ms | "         \
-              << info_str << std::endl;                                            \
-    return __ret;                                                                  \
-})()
-
-// -------------------------------------
-// Thread-local pinned buffer
-// -------------------------------------
-struct PinnedBufferInfo {
-    void* ptr = nullptr;
-    size_t size = 0;
-};
-
-static thread_local void* t_pinned_ptr = nullptr;
-static thread_local size_t t_pinned_size = 0;
-static std::vector<PinnedBufferInfo> g_pinned_buffers;
-
-static std::pair<void*, size_t> get_thread_local_pinned(size_t required_bytes) {
-    if (!t_pinned_ptr || t_pinned_size < required_bytes) {
-        if (t_pinned_ptr) {
-            cudaFreeHost(t_pinned_ptr);
-            t_pinned_ptr = nullptr;
-            t_pinned_size = 0;
-        }
-
-        size_t alloc_size = std::max(required_bytes, (size_t)16 * 1024 * 1024);
-        cudaError_t err = cudaHostAlloc(
-            &t_pinned_ptr,
-            alloc_size,
-            cudaHostAllocMapped | cudaHostAllocPortable
-        );
-
-        if (err != cudaSuccess) {
-            std::cerr << "[ERROR] cudaHostAlloc failed: "
-                      << cudaGetErrorString(err) << "\n";
-            t_pinned_ptr = nullptr;
-            t_pinned_size = 0;
-        } else {
-            t_pinned_size = alloc_size;
-            DEBUG_PRINT("[INFO] Thread " << std::this_thread::get_id()
-                      << " allocated pinned buffer "
-                      << (alloc_size / (1024 * 1024)) << " MB");
-        }
-    }
-    return {t_pinned_ptr, t_pinned_size};
-}
-
-void preallocate_pinned_buffers(size_t io_threads, size_t pinned_buffer_size_mb) {
-    g_pinned_buffers.resize(io_threads);
-    size_t alloc_bytes = pinned_buffer_size_mb * 1024 * 1024;
-
-    std::vector<std::thread> workers;
-    workers.reserve(io_threads);
-
-    for (size_t i = 0; i < io_threads; ++i) {
-        workers.emplace_back([i, alloc_bytes]() {
-            auto [ptr, size] = get_thread_local_pinned(alloc_bytes);
-            if (!ptr) {
-                std::cerr << "[ERROR] Failed to preallocate pinned buffer for thread "
-                          << i << std::endl;
-                g_pinned_buffers[i] = {nullptr, 0};
-            } else {
-                g_pinned_buffers[i] = {ptr, size};
-            }
-        });
-    }
-
-    // Wait for all threads to complete initialization
-    for (auto& t : workers) t.join();
-
-    std::cout << "[INFO] Pre-allocated pinned buffer "
-              << (alloc_bytes / (1024 * 1024))
-              << " MB for " << io_threads << " threads" << std::endl;
-}
 
 // Tracks async job progress and results
 struct JobState {
@@ -140,179 +49,24 @@ struct JobState {
 // Global resources - TODO should removed all Global variables
 // --------------------------------------
 // CUDA streams assigned to each worker thread
-static std::vector<at::cuda::CUDAStream> g_streams;
+std::vector<at::cuda::CUDAStream> g_streams;
 
 // Thread-local CUDA stream used by the current worker
-static thread_local std::optional<c10::cuda::CUDAStream> thread_stream;
+thread_local std::optional<c10::cuda::CUDAStream> thread_stream;
 // Thread-local stream index for mapping worker threads to streams
-static thread_local size_t thread_stream_idx = 0;
+thread_local size_t thread_stream_idx = 0;
 
 // Mutex protecting access to the jobs map
 static std::mutex jobs_mutex;
 // Global map of job_id → JobState, tracking async job progress
-static std::map<int, std::unique_ptr<JobState>> jobs;
+std::map<int, std::unique_ptr<JobState>> jobs;
 
-// Optimized memcpy kernel using vectorized loads
-template<typename T = uint4>
-__global__ void memcpy_kernel(const char* __restrict__ src,
-                              char* __restrict__ dst,
-                              size_t num_bytes) {
-    // Vector size (default: 16 bytes if T=uint4)
-    constexpr size_t vec_size = sizeof(T);
-    // Number of full vector elements we can copy
-    const size_t total_vecs = num_bytes / vec_size;
-    // Global stride: total number of threads across all blocks in the grid (gridDim.x = number of blocks, blockDim.x = threads per block)
-    // Each thread will advance by this stride in the loop to cover all data
-    const size_t stride = gridDim.x * blockDim.x;
-    // Reinterpret byte pointers as vector types to enable wide 16-byte loads/stores
-    const T* src_vec = reinterpret_cast<const T*>(src);
-    T* dst_vec = reinterpret_cast<T*>(dst);
 
-    // Each thread copies multiple vector elements starting from its global index, jumping by 'stride' each iteration
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_vecs;
-         idx += stride) {
-        dst_vec[idx] = src_vec[idx];
-    }
-
-    // Remaining tail bytes
-    size_t tail_start = total_vecs * vec_size;
-    for (size_t i = tail_start + blockIdx.x * blockDim.x + threadIdx.x;
-         i < num_bytes;
-         i += stride) {
-        dst[i] = src[i];
-    }
-}
-
-// Launch helper function
-inline void launch_memcpy_kernel(
-    const void* src,
-    void* dst,
-    size_t bytes,
-    const c10::cuda::CUDAStream& stream) {
-
-    if (bytes == 0) return;
-
-    constexpr int threads = 256;
-    // Compute number of blocks to cover all data; limit to 1024 for practicality
-    int blocks = std::min((int)((bytes + threads - 1) / threads), 1024);
-
-    // Each block contains 256 threads; launch up to 1024 blocks (≈262K threads total)
-    memcpy_kernel<<<blocks, threads, 0, stream.stream()>>>(
-        static_cast<const char*>(src),
-        static_cast<char*>(dst),
-        bytes);
-
-    // Check for launch errors
-    cudaError_t launch_err = cudaGetLastError();
-    if (launch_err != cudaSuccess) {
-        std::cerr << "[ERROR] Kernel launch failed: "
-                  << cudaGetErrorString(launch_err) << std::endl;
-    }
-}
-
-// -------------------------------
-// I/O thread pool for scheduling
-// -------------------------------
-class IOThreadPool {
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    std::atomic<bool> stop{false};
-    int m_device_id;
-
-public:
-       IOThreadPool(int threads, size_t pinned_buffer_mb, int tp_rank, int device_id) : m_device_id(device_id) {
-
-        // Initialize PyTorch threading globally (main thread only)
-        at::init_num_threads();
-        at::set_num_threads(1);
-        int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);  // number of available logical CPUs
-        for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this, i, threads, pinned_buffer_mb, tp_rank, device_id, num_cpus] {
-
-                // Set CUDA device for this thread FIRST
-                cudaSetDevice(device_id);
-
-                // Compute unique CPU per thread
-                int cpu_id = (tp_rank * threads + i) % num_cpus;
-                cpu_set_t cpuset;
-                CPU_ZERO(&cpuset);
-                CPU_SET(cpu_id, &cpuset);
-
-                if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
-                    std::cerr << "[WARN] Failed to set affinity for thread " << i
-                              << " tp_rank=" << tp_rank << " to CPU " << cpu_id << "\n";
-                }
-
-                pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
-                int actual_cpu = sched_getcpu();
-
-                DEBUG_PRINT("IO thread " << i
-                          << " set CUDA device to " << device_id
-                          << " (tid=" << tid << ", tp_rank=" << tp_rank
-                          << ") pinned to CPU " << cpu_id
-                          << " (running on CPU " << actual_cpu << ")");
-
-                // Attach preallocated pinned buffer
-                if (i < g_pinned_buffers.size() && g_pinned_buffers[i].ptr != nullptr) {
-                    t_pinned_ptr = g_pinned_buffers[i].ptr;
-                    t_pinned_size = g_pinned_buffers[i].size;
-                    DEBUG_PRINT("IO thread " << i
-                            << " attached to preallocated pinned buffer "
-                            << (t_pinned_size / (1024 * 1024)) << " MB");
-                } else {
-                    std::cerr << "[WARN] IO thread " << i
-                            << " has no preallocated pinned buffer\n";
-                }
-
-                thread_stream_idx = i;
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex);
-                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
-                        if (stop && tasks.empty()) return;
-                        task = std::move(tasks.front());
-                        tasks.pop();
-                    }
-                    task();
-                }
-            });
-        }
-    }
-
-    ~IOThreadPool() {
-        stop = true;
-        condition.notify_all();
-        for (std::thread &worker : workers) {
-            worker.join();
-        }
-    }
-
-    template<class F>
-    auto enqueue(F&& f) -> std::future<typename std::result_of<F()>::type> {
-        using return_type = typename std::result_of<F()>::type;
-
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            std::forward<F>(f)
-        );
-
-        std::future<return_type> res = task->get_future();
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            if (stop) throw std::runtime_error("enqueue on stopped ThreadPool");
-            tasks.emplace([task](){ (*task)(); });
-        }
-        condition.notify_one();
-        return res;
-    }
-};
+thread_local void* t_pinned_ptr = nullptr;
+thread_local size_t t_pinned_size = 0;
 
 // Global IO thread pool for scheduling async PUT/GET tasks
-static std::unique_ptr<IOThreadPool> g_io_pool;
+static std::unique_ptr<ThreadPool> g_io_pool;
 
 // -------------------------------
 // Initialize resources with pre-allocation
@@ -329,19 +83,20 @@ void init_performance_resources(int io_threads = 0, size_t pinned_buffer_size_mb
         int device_id;
         cudaGetDevice(&device_id);
 
-        std::cout << "[INFO] Initializing IOThreadPool with "
+        std::cout << "[INFO] Initializing ThreadPool with "
                   << io_threads << " threads on device " << device_id
                   << ", " << pinned_buffer_size_mb << " MB pinned buffer per thread, "
                   << max_pinned_memory_gb << " GB max pinned memory\n";
 
         // Enable GPU access to mapped host memory (needed only for cudaHostAllocMapped before any CUDA context)
         cudaSetDeviceFlags(cudaDeviceMapHost);
-
+        int gpu_numa = get_gpu_numa_node(device_id);
+        numa_set_preferred(gpu_numa);
         // Pre-allocate pinned buffers before launching threads
         preallocate_pinned_buffers(io_threads, pinned_buffer_size_mb);
 
         // Pass device_id to thread pool
-        g_io_pool = std::make_unique<IOThreadPool>(io_threads, pinned_buffer_size_mb,
+        g_io_pool = std::make_unique<ThreadPool>(io_threads, pinned_buffer_size_mb,
                                                     tp_rank, device_id);
 
         // Create dedicated streams for each thread on the current device
@@ -403,6 +158,52 @@ void cleanup_performance_resources() {
 //----------------------------------------------------------------------
 // GPU → Storage (PUT)
 // ----------------------------------------------------------------------
+__global__ void copy_blocks_kernel(
+    const uint8_t* __restrict__ src_base,           // Source (CPU for GET, GPU for PUT)
+    uint8_t* __restrict__ dst_base,                 // Destination (GPU for GET, CPU for PUT)
+    const int64_t* __restrict__ block_ids,          // Global block IDs to copy
+    const int64_t* __restrict__ src_block_offsets,  // Per-block source offsets (within file or buffer)
+    const int num_blocks,                           // Number of blocks to copy
+    const int layer,                                // Layer index
+    const int64_t num_blocks_tot,                   // Total blocks per tensor (used for offset math)
+    const size_t bytes_per_plane,                   // Bytes per K or V plane
+    const size_t bytes_per_block,                   // Total bytes per block (K+V)
+    const bool is_put) {                            // Add direction flag
+
+    const int bi = blockIdx.x;          // block index
+    const int k_or_v = blockIdx.y;      // 0=K, 1=V
+    const int tid = threadIdx.x;
+
+    if (bi >= num_blocks) return;
+
+    const int64_t gblock = block_ids[bi];
+    const size_t src_block_base = src_block_offsets[bi];
+
+    size_t src_offset, dst_offset;
+
+    if (is_put) {
+        // PUT: GPU→CPU Source is GPU, destination is CPU
+        src_offset = static_cast<size_t>(gblock + k_or_v * num_blocks_tot) * bytes_per_plane;
+        dst_offset = src_block_base +
+                     static_cast<size_t>(layer) * bytes_per_block +
+                     (k_or_v == 1 ? bytes_per_plane : 0);
+    } else {
+        // GET: CPU→GPU - Source is CPU, destination is GPU
+        src_offset = src_block_base +
+                     static_cast<size_t>(layer) * bytes_per_block +
+                     (k_or_v == 1 ? bytes_per_plane : 0);
+        dst_offset = static_cast<size_t>(gblock + k_or_v * num_blocks_tot) * bytes_per_plane;
+    }
+
+    const uint8_t* src = src_base + src_offset;
+    uint8_t* dst = dst_base + dst_offset;
+
+    for (size_t i = tid; i < bytes_per_plane; i += blockDim.x) {
+        dst[i] = src[i];  // Copy cooperatively across threads
+    }
+}
+
+
 // Copy selected GPU tensor blocks into pinned CPU buffer asynchronously
 torch::Tensor copy_gpu_tensors_to_buffer(
     const std::vector<torch::Tensor>& src_tensors,
@@ -415,9 +216,6 @@ torch::Tensor copy_gpu_tensors_to_buffer(
 
     const auto shape = ref.sizes();  // [2, num_blocks_total, H, B, D]
     TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
-
-    // Ensure we're on the same device as the source tensors
-    // c10::cuda::CUDAGuard device_guard(src_tensors[0].device());
 
     const int64_t num_blocks_tot = shape[1];
     const int64_t H = shape[2];  //H: number of attention heads
@@ -447,33 +245,84 @@ torch::Tensor copy_gpu_tensors_to_buffer(
 
     auto* cpu_base = static_cast<uint8_t*>(pinned_ptr);
 
-    // Direct pointer arithmetic - NO INDEXING operations
-    for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
-        const int64_t gblock = block_ids_list[bi];
-        const size_t cpu_block_base = bi * num_layers * bytes_per_block;
+    const char* env = std::getenv("USE_KERNEL_COPY_WRITE");
+    bool use_kernel_copy_write = (env && std::string(env) == "1");
+    if (use_kernel_copy_write) {
+        // Prepare block IDs and CPU offsets
+        std::vector<int64_t> cpu_offsets(block_ids_list.size());
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            cpu_offsets[bi] = bi * num_layers * bytes_per_block;
+        }
 
+        // Create tensor view of block IDs and transfer to GPU memory
+        torch::Tensor block_ids_tensor = torch::from_blob(
+            const_cast<int64_t*>(block_ids_list.data()),
+            {static_cast<int64_t>(block_ids_list.size())},
+            torch::dtype(torch::kInt64)
+        ).to(torch::kCUDA, /*non_blocking=*/true);
+
+        // Create tensor view of CPU offsets and transfer to GPU memory
+        torch::Tensor cpu_offsets_tensor = torch::from_blob(
+            cpu_offsets.data(),
+            {static_cast<int64_t>(cpu_offsets.size())},
+            torch::dtype(torch::kInt64)
+        ).to(torch::kCUDA, /*non_blocking=*/true);
+
+        // Map pinned CPU memory to device pointer (required for GPU kernel to write to host memory - zero-copy)
+        uint8_t* cpu_base_dev = nullptr;
+        cudaError_t map_err = cudaHostGetDevicePointer(&cpu_base_dev, cpu_base, 0);
+        TORCH_CHECK(map_err == cudaSuccess,
+            "cudaHostGetDevicePointer failed: ", cudaGetErrorString(map_err));
+
+        // Launch one kernel per layer
+        dim3 grid(block_ids_list.size(), 2);  // (blocks, K/V)
+        dim3 block(512); // TODO check optimal thread count (256 or 512)
+
+        // Launch copy kernel for each layer
         for (int layer = 0; layer < num_layers; ++layer) {
-            const auto& layer_tensor = src_tensors[layer];
-            auto* src_base = reinterpret_cast<const uint8_t*>(layer_tensor.data_ptr());
+            const uint8_t* src_ptr = reinterpret_cast<const uint8_t*>(src_tensors[layer].data_ptr());
+            copy_blocks_kernel<<<grid, block, 0, stream.stream()>>>(
+                src_ptr,                                    // Source: GPU tensor
+                cpu_base_dev,                               // Destination: CPU pinned memory
+                block_ids_tensor.data_ptr<int64_t>(),
+                cpu_offsets_tensor.data_ptr<int64_t>(),
+                block_ids_list.size(),
+                layer,
+                num_blocks_tot,
+                bytes_per_plane,
+                bytes_per_block,
+                true  // is_put = true
+            );
+        }
 
-            // Compute GPU source offsets for K and V
-            const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
-            const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
+        // Check for kernel launch errors
+        cudaError_t launch_err = cudaGetLastError();
+        TORCH_CHECK(launch_err == cudaSuccess,
+            "Kernel launch failed: ", cudaGetErrorString(launch_err));
 
-            // Compute CPU destination offsets for K and V
-            const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
-            const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
+    } else {  // Default behavior - memcpyAsync path
+        // Direct pointer arithmetic - NO INDEXING operations
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            const int64_t gblock = block_ids_list[bi];
+            const size_t cpu_block_base = bi * num_layers * bytes_per_block;
 
-            const void* src_K = src_base + gpu_K_off;
-            const void* src_V = src_base + gpu_V_off;
-            void* dst_K = cpu_base + cpu_K_off;
-            void* dst_V = cpu_base + cpu_V_off;
+            for (int layer = 0; layer < num_layers; ++layer) {
+                const auto& layer_tensor = src_tensors[layer];
+                auto* src_base = reinterpret_cast<const uint8_t*>(layer_tensor.data_ptr());
 
-            const char* env = std::getenv("USE_KERNEL_COPY_WRITE");
-            bool use_kernel_copy_write = (env && std::string(env) == "1");
+                // Compute GPU source offsets for K and V
+                const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
+                const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
 
-            if (!use_kernel_copy_write) {
-                // Default behavior: Standard cudaMemcpyAsync path
+                // Compute CPU destination offsets for K and V
+                const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
+                const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
+
+                const void* src_K = src_base + gpu_K_off;
+                const void* src_V = src_base + gpu_V_off;
+                void* dst_K = cpu_base + cpu_K_off;
+                void* dst_V = cpu_base + cpu_V_off;
+
                 cudaError_t err1 = cudaMemcpyAsync(
                     dst_K, src_K, bytes_per_plane,
                     cudaMemcpyDeviceToHost, stream.stream());
@@ -490,37 +339,10 @@ torch::Tensor copy_gpu_tensors_to_buffer(
                               << std::endl;
                     TORCH_CHECK(false, "cudaMemcpyAsync failed");
                 }
-            } else {
-                // Experimental kernel path
-                void* dst_K_mapped = nullptr;
-                void* dst_V_mapped = nullptr;
-
-                cudaError_t map_err1 = cudaHostGetDevicePointer(&dst_K_mapped, dst_K, 0);
-                cudaError_t map_err2 = cudaHostGetDevicePointer(&dst_V_mapped, dst_V, 0);
-
-                if (map_err1 != cudaSuccess || map_err2 != cudaSuccess) {
-                    std::cerr << "[ERROR] cudaHostGetDevicePointer failed for block=" << gblock
-                              << " layer=" << layer
-                              << " err1=" << cudaGetErrorString(map_err1)
-                              << " err2=" << cudaGetErrorString(map_err2)
-                              << std::endl;
-                    TORCH_CHECK(false, "cudaHostGetDevicePointer failed");
-                }
-
-                // Use GPU kernel to copy into mapped host memory
-                launch_memcpy_kernel(src_K, dst_K_mapped, bytes_per_plane, stream);
-                launch_memcpy_kernel(src_V, dst_V_mapped, bytes_per_plane, stream);
             }
         }
     }
 
-    // Check for kernel launch errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "[ERROR] Kernel launch failed: "
-                  << cudaGetErrorString(err) << std::endl;
-        TORCH_CHECK(false, "Kernel launch failed");
-    }
     // Reinterpret bfloat16 tensor as uint16_t for safe raw byte access (I/O or memcpy)
     if (result_cpu.dtype() == torch::kBFloat16) {
         result_cpu = result_cpu.view(torch::kUInt16);
@@ -710,9 +532,8 @@ torch::Tensor read_file_from_disk(const std::string& path) {
     );
     return tensor;
 }
-// Copy buffer to GPU tensors asynchronously using cudaMemcpyAsync (no swap_blocks)
-// CPU layout (contiguous): [num_blocks_in_file, num_layers, 2, H, B, D]
-// GPU layout (contiguous): [2, num_blocks_total, H, B, D]
+
+
 bool copy_buffer_to_gpu_tensors(
     torch::Tensor cpu_buf,
     const std::vector<int64_t>& block_ids_list,
@@ -732,52 +553,96 @@ bool copy_buffer_to_gpu_tensors(
     const auto shape = ref.sizes();  // [2, num_blocks_total, H, B, D]
     TORCH_CHECK(shape.size() == 5, "Expected shape [2, num_blocks, H, B, D]");
 
-    // Ensure we're on the same device as the destination tensors
-    c10::cuda::CUDAGuard device_guard(dst_tensors[0].device());
-
     const int64_t num_blocks_tot = shape[1];
-    const int64_t H = shape[2];  //H: number of attention heads
-    const int64_t B = shape[3]; // B: number of tokens per block (block size)
-    const int64_t D = shape[4]; // D: head dimension
+    const int64_t H = shape[2];  // H: number of attention heads
+    const int64_t B = shape[3];  // B: number of tokens per block (block size)
+    const int64_t D = shape[4];  // D: head dimension
     const int num_layers = static_cast<int>(dst_tensors.size());
 
-    const size_t elem_size = ref.element_size(); // Size (in bytes) of a single element (e.g., 2 for float16, 4 for float32)
+    const size_t elem_size = ref.element_size(); // Size (in bytes) of a single element
 
     const size_t bytes_per_plane = static_cast<size_t>(H * B * D) * elem_size;
     const size_t bytes_per_block = 2 * bytes_per_plane;  // [K,V] in CPU buf
 
     auto* cpu_base = cpu_buf.data_ptr<uint8_t>();
 
-    for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
-        const int64_t gblock = block_ids_list[bi];
-        const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
-        const size_t cpu_block_base = static_cast<size_t>(lblock) * num_layers * bytes_per_block;
+    const char* env = std::getenv("USE_KERNEL_COPY_READ");
+    bool use_kernel_copy_read = (!env || std::string(env) != "0");
+
+    if (use_kernel_copy_read) {  // Default behavior - batched kernel
+        // Calculate CPU buffer offset for each block (maps global block ID to local file offset)
+        std::vector<int64_t> cpu_offsets(block_ids_list.size());
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            const int64_t gblock = block_ids_list[bi];
+            const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
+            cpu_offsets[bi] = static_cast<int64_t>(lblock) * num_layers * bytes_per_block;
+        }
+
+        // Wrap block IDs in tensor and copy to GPU for kernel access
+        torch::Tensor block_ids_tensor = torch::from_blob(
+            const_cast<int64_t*>(block_ids_list.data()),
+            {static_cast<int64_t>(block_ids_list.size())},
+            torch::dtype(torch::kInt64)
+        ).to(torch::kCUDA, /*non_blocking=*/true);
+
+        // Wrap CPU offsets in tensor and copy to GPU for kernel access
+        torch::Tensor cpu_offsets_tensor = torch::from_blob(
+            cpu_offsets.data(),
+            {static_cast<int64_t>(cpu_offsets.size())},
+            torch::dtype(torch::kInt64)
+        ).to(torch::kCUDA, /*non_blocking=*/true);
+
+        // Launch one kernel per layer
+        dim3 grid(block_ids_list.size(), 2);  // (blocks, K/V)
+        dim3 block(512); //TODO chechk optimal thread count (256 or 512)
 
         for (int layer = 0; layer < num_layers; ++layer) {
-            const auto& layer_tensor = dst_tensors[layer];
-            auto* dst_base = reinterpret_cast<uint8_t*>(layer_tensor.data_ptr());
+            uint8_t* dst_ptr = reinterpret_cast<uint8_t*>(dst_tensors[layer].data_ptr());
 
-            // Compute CPU source offsets for K and V
-            const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
-            const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
+            copy_blocks_kernel<<<grid, block, 0, stream.stream()>>>(
+                cpu_base,
+                dst_ptr,
+                block_ids_tensor.data_ptr<int64_t>(),
+                cpu_offsets_tensor.data_ptr<int64_t>(),
+                block_ids_list.size(),
+                layer,
+                num_blocks_tot,
+                bytes_per_plane,
+                bytes_per_block,
+                false // is_put = false
+            );
+        }
 
-            // Compute GPU destination offsets for K and V
-            const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
-            const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
+        cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess) {
+            std::cerr << "[ERROR] Kernel launch failed: "
+                    << cudaGetErrorString(launch_err) << std::endl;
+            return false;
+        }
 
-            void* dst_K = dst_base + gpu_K_off;
-            void* dst_V = dst_base + gpu_V_off;
-            void* src_K = cpu_base + cpu_K_off;
-            void* src_V = cpu_base + cpu_V_off;
+    } else {  // Standard cudaMemcpyAsync path
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            const int64_t gblock = block_ids_list[bi];
+            const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
+            const size_t cpu_block_base = static_cast<size_t>(lblock) * num_layers * bytes_per_block;
 
-            const char* env = std::getenv("USE_KERNEL_COPY_READ");
-            bool use_kernel_copy_read = (!env || std::string(env) != "0");
-            if (use_kernel_copy_read) { //Default behaviour
-                // Replace cudaMemcpyAsync with kernel-based copy
-                launch_memcpy_kernel(src_K, dst_K, bytes_per_plane, stream);
-                launch_memcpy_kernel(src_V, dst_V, bytes_per_plane, stream);
-            } else {
-                // Standard cudaMemcpyAsync path
+            for (int layer = 0; layer < num_layers; ++layer) {
+                const auto& layer_tensor = dst_tensors[layer];
+                auto* dst_base = reinterpret_cast<uint8_t*>(layer_tensor.data_ptr());
+
+                // Compute CPU source offsets for K and V
+                const size_t cpu_K_off = cpu_block_base + static_cast<size_t>(layer) * bytes_per_block;
+                const size_t cpu_V_off = cpu_K_off + bytes_per_plane;
+
+                // Compute GPU destination offsets for K and V
+                const size_t gpu_K_off = static_cast<size_t>(gblock) * bytes_per_plane;
+                const size_t gpu_V_off = (static_cast<size_t>(num_blocks_tot) + gblock) * bytes_per_plane;
+
+                void* dst_K = dst_base + gpu_K_off;
+                void* dst_V = dst_base + gpu_V_off;
+                void* src_K = cpu_base + cpu_K_off;
+                void* src_V = cpu_base + cpu_V_off;
+
                 cudaError_t err1 = cudaMemcpyAsync(
                     dst_K, src_K, bytes_per_plane,
                     cudaMemcpyHostToDevice, stream.stream());
@@ -796,14 +661,6 @@ bool copy_buffer_to_gpu_tensors(
                 }
             }
         }
-    }
-
-    // Check for kernel launch errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "[ERROR] Kernel launch failed: "
-                  << cudaGetErrorString(err) << std::endl;
-        return false;
     }
 
     return true;
@@ -830,6 +687,7 @@ bool transfer_async_get_ext(
             // Get dedicated stream for this thread
             if (!thread_stream.has_value()) {
                 thread_stream = g_streams[thread_stream_idx % g_streams.size()];
+                //thread_stream = at::cuda::getStreamFromPool(/* isHighPriority = */ true); // use high-priority stream for reads
             }
 
             // Save current CUDA stream so we can restore it later.
@@ -863,7 +721,6 @@ bool transfer_async_get_ext(
                     // Perform asynchronous GPU copy and tensor swap.
                     ok = TIME_EXPR("read phase 2: copy_buffer_to_gpu_tensors", copy_buffer_to_gpu_tensors(
                         host_buf, block_ids, dst_tensors, gpu_blocks_per_file, *thread_stream), "file: " + src_file);
-
                     cudaError_t err = cudaStreamSynchronize(thread_stream->stream());
                     if (err != cudaSuccess) {
                         std::cerr << "[ERROR] cudaStreamSynchronize failed: "

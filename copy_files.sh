@@ -19,14 +19,17 @@ FILES=(
   # "vllm/v1/kv_offload/factory.py"
 
   # CPU
-  #"vllm/v1/kv_offload/worker/cpu.py"
+  # "vllm/v1/kv_offload/worker/cpu_gpu.py"
 
   # LMCACHE
   #vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
 
   # CUDA
-  "csrc/setup_torch.py"
-  "csrc/storage_offload_ext.cu"
+  # "csrc/storage/storage_setup.py"
+  "csrc/storage/storage_offload.cu"
+  # "csrc/storage/buffer.cpp"
+  # "csrc/storage/debug_utils.cpp"
+  # "csrc/storage/thread_pool.cpp"
   #"csrc/setup.py"
   # "csrc/cache.h"
   # "csrc/cache_kernels.cu"

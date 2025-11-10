@@ -3,7 +3,7 @@
 
 import numpy as np
 import torch
-
+import time
 from vllm import _custom_ops as ops
 from vllm.attention import AttentionBackend
 from vllm.logger import init_logger
@@ -113,6 +113,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        start_time= time.time()
         src_spec, dst_spec = spec
         if isinstance(src_spec, CPULoadStoreSpec):
             assert isinstance(dst_spec, GPULoadStoreSpec)
@@ -158,6 +159,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             for src_tensor, dst_tensor, kv_dim in zip(
                 src_tensors, dst_tensors, self.kv_dim_before_num_blocks
             ):
+                start_time_layer = time.time()
                 if kv_dim:
                     src_key_cache = src_tensor[0]
                     dst_key_cache = dst_tensor[0]
@@ -167,10 +169,21 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                     ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
                 else:
                     ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
+                logger.info(
+                    "Swapped blocks  %d: %.3f ms",
+                    id(src_tensor),
+                    (time.time() - start_time_layer) * 1000,
+                )
             event.record(stream)
 
         self.transfer_events[job_id] = event
-
+        logger.info(
+            "Started transfer job %d: %d src blocks to %d dst blocks in %.3f ms",
+            job_id,
+            src_blocks.size,
+            dst_blocks.size,
+            (time.time() - start_time) * 1000,
+        )
         # success
         return True
 
