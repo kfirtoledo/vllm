@@ -158,48 +158,67 @@ void cleanup_performance_resources() {
 //----------------------------------------------------------------------
 // GPU → Storage (PUT)
 // ----------------------------------------------------------------------
-__global__ void copy_blocks_kernel(
-    const uint8_t* __restrict__ src_base,           // Source (CPU for GET, GPU for PUT)
-    uint8_t* __restrict__ dst_base,                 // Destination (GPU for GET, CPU for PUT)
-    const int64_t* __restrict__ block_ids,          // Global block IDs to copy
-    const int64_t* __restrict__ src_block_offsets,  // Per-block source offsets (within file or buffer)
-    const int num_blocks,                           // Number of blocks to copy
-    const int layer,                                // Layer index
-    const int64_t num_blocks_tot,                   // Total blocks per tensor (used for offset math)
+// Kernel to copy a single block across all layers (parallelized by layer)
+// This processes one block at a time, handling all layers in parallel
+__global__ void copy_single_block_all_layers_kernel(
+    const uint8_t* __restrict__ src_base,           // Source base pointer (CPU for GET, GPU for PUT)
+    uint8_t** __restrict__ dst_ptrs,                // Array of destination pointers (one per layer)
+    const int64_t gblock,                           // Single global block ID to process
+    const size_t src_block_base,                    // Source offset for this block in the buffer
+    const int num_layers,                           // Total number of layers
+    const int64_t num_blocks_tot,                   // Total blocks per tensor (for offset calculation)
     const size_t bytes_per_plane,                   // Bytes per K or V plane
-    const size_t bytes_per_block,                   // Total bytes per block (K+V)
-    const bool is_put) {                            // Add direction flag
+    const size_t bytes_per_block,                   // Total bytes per block (K+V combined)
+    const bool is_put) {                            // Direction flag: true=GPU→CPU, false=CPU→GPU
 
-    const int bi = blockIdx.x;          // block index
+    const int layer = blockIdx.x;       // Parallelize over layers
     const int k_or_v = blockIdx.y;      // 0=K, 1=V
-    const int tid = threadIdx.x;
+    const int tid = threadIdx.x;        // Thread ID within block
+    const int num_threads = blockDim.x; // Total threads per block
 
-    if (bi >= num_blocks) return;
-
-    const int64_t gblock = block_ids[bi];
-    const size_t src_block_base = src_block_offsets[bi];
+    // Boundary check: ensure we don't exceed the number of layers
+    if (layer >= num_layers) return;
 
     size_t src_offset, dst_offset;
 
     if (is_put) {
-        // PUT: GPU→CPU Source is GPU, destination is CPU
+        // PUT: GPU→CPU
+        // Calculate source offset in GPU tensor (reading from GPU)
         src_offset = static_cast<size_t>(gblock + k_or_v * num_blocks_tot) * bytes_per_plane;
+
+        // Calculate destination offset in CPU buffer (writing to CPU)
         dst_offset = src_block_base +
                      static_cast<size_t>(layer) * bytes_per_block +
                      (k_or_v == 1 ? bytes_per_plane : 0);
+
+        // Source: GPU tensor for this layer
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(dst_ptrs[layer]) + src_offset;
+        // Destination: CPU pinned buffer
+        uint8_t* dst = const_cast<uint8_t*>(src_base) + dst_offset;
+
+        // Cooperatively copy bytes_per_plane bytes using all threads
+        for (size_t i = tid; i < bytes_per_plane; i += num_threads) {
+            dst[i] = src[i];
+        }
     } else {
-        // GET: CPU→GPU - Source is CPU, destination is GPU
+        // GET: CPU→GPU
+        // Calculate source offset in CPU buffer (reading from CPU)
         src_offset = src_block_base +
                      static_cast<size_t>(layer) * bytes_per_block +
                      (k_or_v == 1 ? bytes_per_plane : 0);
+
+        // Calculate destination offset in GPU tensor (writing to GPU)
         dst_offset = static_cast<size_t>(gblock + k_or_v * num_blocks_tot) * bytes_per_plane;
-    }
 
-    const uint8_t* src = src_base + src_offset;
-    uint8_t* dst = dst_base + dst_offset;
+        // Source: CPU pinned buffer
+        const uint8_t* src = src_base + src_offset;
+        // Destination: GPU tensor for this layer
+        uint8_t* dst = dst_ptrs[layer] + dst_offset;
 
-    for (size_t i = tid; i < bytes_per_plane; i += blockDim.x) {
-        dst[i] = src[i];  // Copy cooperatively across threads
+        // Cooperatively copy bytes_per_plane bytes using all threads
+        for (size_t i = tid; i < bytes_per_plane; i += num_threads) {
+            dst[i] = src[i];
+        }
     }
 }
 
@@ -248,25 +267,18 @@ torch::Tensor copy_gpu_tensors_to_buffer(
     const char* env = std::getenv("USE_KERNEL_COPY_WRITE");
     bool use_kernel_copy_write = (env && std::string(env) == "1");
     if (use_kernel_copy_write) {
-        // Prepare block IDs and CPU offsets
-        std::vector<int64_t> cpu_offsets(block_ids_list.size());
-        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
-            cpu_offsets[bi] = bi * num_layers * bytes_per_block;
+        // Prepare device pointers for layers (one pointer per layer)
+        std::vector<uint8_t*> h_src_ptrs(num_layers);
+        for (int layer = 0; layer < num_layers; ++layer) {
+            h_src_ptrs[layer] = reinterpret_cast<uint8_t*>(src_tensors[layer].data_ptr());
         }
 
-        // Create tensor view of block IDs and transfer to GPU memory
-        torch::Tensor block_ids_tensor = torch::from_blob(
-            const_cast<int64_t*>(block_ids_list.data()),
-            {static_cast<int64_t>(block_ids_list.size())},
-            torch::dtype(torch::kInt64)
-        ).to(torch::kCUDA, /*non_blocking=*/true);
-
-        // Create tensor view of CPU offsets and transfer to GPU memory
-        torch::Tensor cpu_offsets_tensor = torch::from_blob(
-            cpu_offsets.data(),
-            {static_cast<int64_t>(cpu_offsets.size())},
-            torch::dtype(torch::kInt64)
-        ).to(torch::kCUDA, /*non_blocking=*/true);
+        // Allocate and copy layer pointers to GPU memory
+        uint8_t** d_src_ptrs;
+        cudaMalloc(&d_src_ptrs, num_layers * sizeof(uint8_t*));
+        cudaMemcpyAsync(d_src_ptrs, h_src_ptrs.data(),
+                        num_layers * sizeof(uint8_t*),
+                        cudaMemcpyHostToDevice, stream.stream());
 
         // Map pinned CPU memory to device pointer (required for GPU kernel to write to host memory - zero-copy)
         uint8_t* cpu_base_dev = nullptr;
@@ -274,24 +286,26 @@ torch::Tensor copy_gpu_tensors_to_buffer(
         TORCH_CHECK(map_err == cudaSuccess,
             "cudaHostGetDevicePointer failed: ", cudaGetErrorString(map_err));
 
-        // Launch one kernel per layer
-        dim3 grid(block_ids_list.size(), 2);  // (blocks, K/V)
-        dim3 block(512); // TODO check optimal thread count (256 or 512)
+        // Launch kernel for each block: process all layers for this block
+        dim3 grid(num_layers, 2);  // (layers, K/V)
+        dim3 block(512);           // threads per block - TODO check optimal thread count
 
-        // Launch copy kernel for each layer
-        for (int layer = 0; layer < num_layers; ++layer) {
-            const uint8_t* src_ptr = reinterpret_cast<const uint8_t*>(src_tensors[layer].data_ptr());
-            copy_blocks_kernel<<<grid, block, 0, stream.stream()>>>(
-                src_ptr,                                    // Source: GPU tensor
-                cpu_base_dev,                               // Destination: CPU pinned memory
-                block_ids_tensor.data_ptr<int64_t>(),
-                cpu_offsets_tensor.data_ptr<int64_t>(),
-                block_ids_list.size(),
-                layer,
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            const int64_t gblock = block_ids_list[bi];
+            // Calculate base offset in CPU buffer for this block
+            const size_t cpu_block_base = bi * num_layers * bytes_per_block;
+
+            // Kernel launch: process all layers for this block
+            copy_single_block_all_layers_kernel<<<grid, block, 0, stream.stream()>>>(
+                cpu_base_dev,           // Destination: CPU pinned memory (mapped to device)
+                d_src_ptrs,             // Source: array of GPU tensor pointers (one per layer)
+                gblock,                 // Global block ID
+                cpu_block_base,         // CPU buffer offset for this block
+                num_layers,
                 num_blocks_tot,
                 bytes_per_plane,
                 bytes_per_block,
-                true  // is_put = true
+                true  // is_put = true (GPU→CPU direction)
             );
         }
 
@@ -299,6 +313,9 @@ torch::Tensor copy_gpu_tensors_to_buffer(
         cudaError_t launch_err = cudaGetLastError();
         TORCH_CHECK(launch_err == cudaSuccess,
             "Kernel launch failed: ", cudaGetErrorString(launch_err));
+
+        // Cleanup device memory
+        cudaFree(d_src_ptrs);
 
     } else {  // Default behavior - memcpyAsync path
         // Direct pointer arithmetic - NO INDEXING operations
@@ -570,55 +587,55 @@ bool copy_buffer_to_gpu_tensors(
     bool use_kernel_copy_read = (!env || std::string(env) != "0");
 
     if (use_kernel_copy_read) {  // Default behavior - batched kernel
-        // Calculate CPU buffer offset for each block (maps global block ID to local file offset)
-        std::vector<int64_t> cpu_offsets(block_ids_list.size());
-        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
-            const int64_t gblock = block_ids_list[bi];
-            const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
-            cpu_offsets[bi] = static_cast<int64_t>(lblock) * num_layers * bytes_per_block;
+        // Prepare device pointers for layers (one pointer per layer)
+        std::vector<uint8_t*> h_dst_ptrs(num_layers);
+        for (int layer = 0; layer < num_layers; ++layer) {
+            h_dst_ptrs[layer] = reinterpret_cast<uint8_t*>(dst_tensors[layer].data_ptr());
         }
 
-        // Wrap block IDs in tensor and copy to GPU for kernel access
-        torch::Tensor block_ids_tensor = torch::from_blob(
-            const_cast<int64_t*>(block_ids_list.data()),
-            {static_cast<int64_t>(block_ids_list.size())},
-            torch::dtype(torch::kInt64)
-        ).to(torch::kCUDA, /*non_blocking=*/true);
+        // Allocate and copy layer pointers to GPU memory
+        uint8_t** d_dst_ptrs;
+        cudaMalloc(&d_dst_ptrs, num_layers * sizeof(uint8_t*));
+        cudaMemcpyAsync(d_dst_ptrs, h_dst_ptrs.data(),
+                        num_layers * sizeof(uint8_t*),
+                        cudaMemcpyHostToDevice, stream.stream());
 
-        // Wrap CPU offsets in tensor and copy to GPU for kernel access
-        torch::Tensor cpu_offsets_tensor = torch::from_blob(
-            cpu_offsets.data(),
-            {static_cast<int64_t>(cpu_offsets.size())},
-            torch::dtype(torch::kInt64)
-        ).to(torch::kCUDA, /*non_blocking=*/true);
+        // Launch kernel for each block: process all layers for this block
+        dim3 grid(num_layers, 2);  // (layers, K/V)
+        dim3 block(512);           // threads per block - TODO check optimal thread count
 
-        // Launch one kernel per layer
-        dim3 grid(block_ids_list.size(), 2);  // (blocks, K/V)
-        dim3 block(512); //TODO chechk optimal thread count (256 or 512)
+        for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
+            const int64_t gblock = block_ids_list[bi];
+            // Map global block ID to local file block ID
+            const int64_t lblock = (num_blocks_in_file > 0) ? (gblock % num_blocks_in_file) : 0;
+            // Calculate base offset in CPU buffer for this block
+            const size_t cpu_block_base = static_cast<size_t>(lblock) * num_layers * bytes_per_block;
 
-        for (int layer = 0; layer < num_layers; ++layer) {
-            uint8_t* dst_ptr = reinterpret_cast<uint8_t*>(dst_tensors[layer].data_ptr());
-
-            copy_blocks_kernel<<<grid, block, 0, stream.stream()>>>(
-                cpu_base,
-                dst_ptr,
-                block_ids_tensor.data_ptr<int64_t>(),
-                cpu_offsets_tensor.data_ptr<int64_t>(),
-                block_ids_list.size(),
-                layer,
+            // Kernel launch: process all layers for this block
+            copy_single_block_all_layers_kernel<<<grid, block, 0, stream.stream()>>>(
+                cpu_base,               // Source: CPU pinned buffer
+                d_dst_ptrs,             // Destination: array of GPU tensor pointers (one per layer)
+                gblock,                 // Global block ID
+                cpu_block_base,         // CPU buffer offset for this block
+                num_layers,
                 num_blocks_tot,
                 bytes_per_plane,
                 bytes_per_block,
-                false // is_put = false
+                false  // is_put = false (CPU→GPU direction)
             );
         }
 
+        // Check for kernel launch errors
         cudaError_t launch_err = cudaGetLastError();
         if (launch_err != cudaSuccess) {
             std::cerr << "[ERROR] Kernel launch failed: "
                     << cudaGetErrorString(launch_err) << std::endl;
+            cudaFree(d_dst_ptrs);
             return false;
         }
+
+        // Cleanup device memory
+        cudaFree(d_dst_ptrs);
 
     } else {  // Standard cudaMemcpyAsync path
         for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
