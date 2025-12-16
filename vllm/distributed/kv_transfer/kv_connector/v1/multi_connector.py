@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
@@ -24,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -34,7 +37,33 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
+
 logger = init_logger(__name__)
+
+
+def time_method(name):
+    """Decorator to measure and print execution time of a method."""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            t0 = time.time()
+            result = func(self, *args, **kwargs)
+            dt = time.time() - t0
+            if dt > 0.01:
+                print(f" OffloadingConnector {name} took {dt:.6f} seconds")
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+def slice_kv_blocks(blocks: KVCacheBlocks, start: int, end: int) -> KVCacheBlocks:
+    sliced_groups = []
+    for group in blocks.blocks:
+        sliced_groups.append(group[start:end])
+    return KVCacheBlocks(tuple(sliced_groups))
 
 
 @dataclass
@@ -128,15 +157,43 @@ class MultiConnector(KVConnectorBase_V1):
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
 
+        self.gpu_block_size = vllm_config.cache_config.block_size
+        self.offloaded_block_size = int(
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "block_size", self.gpu_block_size
+            )
+        )
+        assert self.offloaded_block_size % self.gpu_block_size == 0
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
-        self._requests_to_connector: dict[str, int] = {}
+        self._requests_to_connector: dict[str, dict[int, int]] = {}
 
         # Keeps track of *additional* remaining async saves (beyond 1) to be
         # finished per request. Not needed for async loads since we only allow
         # a single connector to load.
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
+
+        self.gpu_block_size = vllm_config.cache_config.block_size
+
+    def debug_print_connectors(self):
+        for idx, (connector, cfg) in enumerate(
+            zip(self._connectors, self._ktc_kv_transfer_config)
+        ):
+            logger.info(
+                "[Connector %s] class=%s, role=%s, engine_id=%s, spec_name=%s",
+                idx,
+                connector.__class__.__name__,
+                cfg.kv_role,
+                cfg.engine_id,
+                cfg.kv_connector_extra_config.get("spec_name"),
+            )
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        if not self._connectors:
+            return False
+        return all(c.prefer_cross_layer_blocks for c in self._connectors)
 
     @classmethod
     def _get_connector_classes_and_configs(
@@ -163,6 +220,18 @@ class MultiConnector(KVConnectorBase_V1):
                 )
             )
         return ret
+
+    def register_cross_layers_kv_cache(
+        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
+    ):
+        # Register on all connectors
+        for c in self._connectors:
+            # Only connectors that understand cross-layer caches
+            if hasattr(c, "register_cross_layers_kv_cache"):
+                c.register_cross_layers_kv_cache(kv_cache, attn_backend)
+            else:
+                # Optionally: fall back to per-layer behavior or log a warning
+                pass
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         for c in self._connectors:
@@ -273,7 +342,10 @@ class MultiConnector(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        to_return = (0, False)
+        best_toks = 0
+        best_async = False
+
+        req_id = request.request_id
         for i, c in enumerate(self._connectors):
             toks, load_async = c.get_num_new_matched_tokens(
                 request, num_computed_tokens
@@ -282,25 +354,81 @@ class MultiConnector(KVConnectorBase_V1):
             # we return None to indicate that we are not done yet.
             if toks is None:
                 return (None, False)
-            # The first connector that has new matched tokens will be assigned
-            # to this request.
-            if to_return[0] == 0 and toks > 0:
-                self._requests_to_connector[request.request_id] = i
-                to_return = (toks, load_async)
-        return to_return
+            # Record every connector's result (hierarchical)
+            # Track best connector
+            if toks > best_toks:
+                hierarchy = self._requests_to_connector.setdefault(req_id, {})
 
+                delta_tokens = toks - best_toks
+                # Align tokens down to the nearest multiple of the offloaded block size
+
+                hierarchy[i] = delta_tokens - (delta_tokens % self.offloaded_block_size)
+                # Append hierarchical entry
+                spec_name = self._ktc_kv_transfer_config[
+                    i
+                ].kv_connector_extra_config.get("spec_name")
+                msg = (
+                    f"MultiKVConnector: Request {req_id} matched {toks} tokens "
+                    + f"from connector: {c.__class__.__name__} spec:"
+                    + f"{spec_name} (index {i})."
+                )
+                logger.info(msg)
+                self.debug_print_connectors()
+                best_toks = toks
+                best_async = load_async
+
+        return (best_toks, best_async)
+
+    @time_method("update_state_after_alloc")
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        chosen_connector = self._requests_to_connector.get(request.request_id, -1)
+        hierarchy = self._requests_to_connector.get(request.request_id)
         empty_blocks = blocks.new_empty()
-        for i, c in enumerate(self._connectors):
-            if i == chosen_connector:
-                # Forward call to the chosen connector (if any).
-                c.update_state_after_alloc(request, blocks, num_external_tokens)
-            else:
-                # Call with empty blocks for other connectors.
+
+        # No hierarchy → all empty
+        if not hierarchy:
+            for c in self._connectors:
                 c.update_state_after_alloc(request, empty_blocks, 0)
+            return
+
+        start_block = 0
+
+        for i, c in enumerate(self._connectors):
+            data = hierarchy.get(i)
+            msg = (
+                f"MultiKVConnector: Request {request.request_id} connector"
+                + f" index {i} data {data} num_external_tokens {num_external_tokens}"
+            )
+            logger.info(msg)
+            if data is None:
+                # Not part of hierarchy
+                c.update_state_after_alloc(request, empty_blocks, 0)
+                continue
+
+            # Convert data (tokens) to block count
+            delta_tokens = data
+            delta_blocks = delta_tokens // self.gpu_block_size
+
+            if delta_blocks == 0 or num_external_tokens == 0:
+                c.update_state_after_alloc(request, empty_blocks, 0)
+                continue
+
+            end_block = start_block + delta_blocks
+            spec_name = self._ktc_kv_transfer_config[i].kv_connector_extra_config.get(
+                "spec_name"
+            )
+            msg = (
+                f"spec: {spec_name}, delta_tokens {delta_tokens},"
+                f" start_block {start_block}, end_block {end_block}"
+            )
+            logger.info(msg)
+
+            # Perform correct KVCacheBlocks slicing
+            block_slice = slice_kv_blocks(blocks, start_block, end_block)
+
+            c.update_state_after_alloc(request, block_slice, delta_tokens)
+            start_block = end_block
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
