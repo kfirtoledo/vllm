@@ -184,6 +184,54 @@ class OffloadingConnectorScheduler:
             self.block_size_factor,
         )
 
+    def _get_request_offload_medium(self, req: Request) -> str | None:
+        """
+        Get the requested offloading medium for a request.
+
+        Args:
+            req: The request object
+
+        Returns:
+            The requested medium ("cpu", "disk", etc.) or None for default behavior
+        """
+        if req.kv_transfer_params is None:
+            return None
+
+        return req.kv_transfer_params.get("offload_medium", None)
+
+    def _should_offload_request(self, req: Request) -> bool:
+        """
+        Determine if a request should be offloaded based on the requested medium.
+        Only offloads if the requested medium is "cpu" or if no medium is specified.
+
+        Args:
+            req: The request object
+
+        Returns:
+            True if the request should be offloaded, False otherwise
+        """
+        requested_medium = self._get_request_offload_medium(req)
+
+        # If no medium specified, use default behavior (offload to cpu)
+        if requested_medium is None:
+            return True
+
+        # Only offload if explicitly set to "cpu"
+        if requested_medium.lower() == "cpu":
+            logger.debug(
+                "Request %s: offloading to CPU (medium=%s)",
+                req.request_id,
+                requested_medium,
+            )
+            return True
+        else:
+            logger.debug(
+                "Request %s: skipping offload (req medium=%s, only 'cpu' supported)",
+                req.request_id,
+                requested_medium,
+            )
+            return False
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -318,6 +366,11 @@ class OffloadingConnectorScheduler:
             block_ids = self._request_block_ids[req_id]
 
             req = self._requests[req_id]
+
+            # Check if this request should be offloaded based on requested medium
+            if not self._should_offload_request(req):
+                continue
+
             new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             total_tokens = req.num_computed_tokens + new_tokens
             num_blocks = total_tokens // self.offloaded_block_size
@@ -545,6 +598,8 @@ class OffloadingConnectorWorker:
             # NOTE(orozery): defer the store to the beginning of the next engine step,
             # so that offloading starts AFTER transfers related to token sampling,
             # thereby avoiding delays to token generation due to offloading.
+            # NOTE: Only requests with offload_medium="cpu" (or default) reach here
+            # due to filtering in _get_reqs_to_store()
             self._unsubmitted_store_jobs.append((job_id, transfer_spec))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
