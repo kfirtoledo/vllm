@@ -85,14 +85,9 @@ class CPUOffloadingManager(OffloadingManager):
 
     # --- OffloadingManager interface ---
 
-    def lookup(self, keys: Iterable[OffloadKey]) -> int | None:
-        hit_count = 0
-        for key in keys:
-            block = self._policy.get(key)
-            if block is None or not block.is_ready:
-                break
-            hit_count += 1
-        return hit_count
+    def lookup(self, key: OffloadKey) -> bool | None:
+        block = self._policy.get(key)
+        return block is not None and block.is_ready
 
     def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
         blocks = []
