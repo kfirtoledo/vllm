@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
@@ -144,6 +144,44 @@ class OffloadingConnectorScheduler:
         self._reqs_being_stored = defaultdict[ReqId, set[OffloadKey]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[OffloadKey]](set)
 
+    def _maximal_prefix_lookup(self, keys: Iterable[OffloadKey]) -> int | None:
+        """Find the length of the maximal prefix of offloaded blocks."""
+        hit_count = 0
+        defer_lookup = False
+        for key in keys:
+            result = self.manager.lookup(key)
+            if result is None:
+                defer_lookup = True
+                # continue lookup to allow manager to kick-off async lookups
+                # for all blocks (until a miss is detected)
+                result = True
+            if not result:
+                break
+            hit_count += 1
+        return hit_count if not defer_lookup else None
+
+    def _sliding_window_lookup(
+        self, keys: Sequence[OffloadKey], sliding_window_size: int
+    ) -> int | None:
+        """Find the maximal ending position of consecutive offloaded blocks
+        within a sliding window."""
+        defer_lookup = False
+        consecutive_hits = 0
+        for idx in range(len(keys) - 1, -1, -1):
+            result = self.manager.lookup(keys[idx])
+            if result is None:
+                defer_lookup = True
+                # continue lookup to allow manager to kick-off async lookups
+                # for all blocks (until a hit is detected)
+                result = False
+            if not result:
+                consecutive_hits = 0
+            else:
+                consecutive_hits += 1
+                if consecutive_hits == sliding_window_size:
+                    return idx + sliding_window_size if not defer_lookup else None
+        return consecutive_hits if not defer_lookup else None
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -200,7 +238,7 @@ class OffloadingConnectorScheduler:
 
             start_block_idx = num_computed_tokens // offloaded_block_size
             offload_keys = offload_keys[start_block_idx:num_blocks]
-            block_hits = self.manager.lookup(offload_keys)
+            block_hits = self._maximal_prefix_lookup(offload_keys)
             if block_hits == 0:
                 return 0, False
 

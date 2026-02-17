@@ -25,8 +25,12 @@ class ExpectedPrepareStoreOutput:
     evicted_keys: list[int]
 
 
+def to_key(int_id: int) -> OffloadKey:
+    return make_offload_key(str(int_id).encode(), 0)
+
+
 def to_keys(int_ids: list[int]) -> list[OffloadKey]:
-    return [make_offload_key(str(i).encode(), 0) for i in int_ids]
+    return [to_key(i) for i in int_ids]
 
 
 def verify_store_output(
@@ -130,7 +134,7 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     manager.complete_store(to_keys([2, 3, 4, 5]))
 
     # block 2 must still be present in the cache
-    assert manager.lookup(to_keys([2])) == 1
+    assert manager.lookup(to_key(2)) is True
 
 
 def test_cpu_manager():
@@ -155,7 +159,8 @@ def test_cpu_manager():
     )
 
     # lookup [1, 2] -> not ready
-    assert cpu_manager.lookup(to_keys([1, 2])) == 0
+    assert cpu_manager.lookup(to_key(1)) is False
+    assert cpu_manager.lookup(to_key(2)) is False
 
     # no events so far
     assert list(cpu_manager.take_events()) == []
@@ -167,9 +172,9 @@ def test_cpu_manager():
     )
 
     # lookup [1, 2]
-    assert cpu_manager.lookup(to_keys([1])) == 1
-    assert cpu_manager.lookup(to_keys([1, 2])) == 2
-    assert cpu_manager.lookup(to_keys([1, 2, 3])) == 2
+    assert cpu_manager.lookup(to_key(1)) is True
+    assert cpu_manager.lookup(to_key(2)) is True
+    assert cpu_manager.lookup(to_key(3)) is False
 
     # prepare store [2, 3, 4, 5] -> evicts [1]
     prepare_store_output = cpu_manager.prepare_store(to_keys([2, 3, 4, 5]))
@@ -192,6 +197,14 @@ def test_cpu_manager():
 
     # complete store [2, 3, 4, 5]
     cpu_manager.complete_store(to_keys([2, 3, 4, 5]))
+
+    # lookup (now that we have [2, 3, 4, 5])
+    assert cpu_manager.lookup(to_key(1)) is False
+    assert cpu_manager.lookup(to_key(2)) is True
+    assert cpu_manager.lookup(to_key(3)) is True
+    assert cpu_manager.lookup(to_key(4)) is True
+    assert cpu_manager.lookup(to_key(5)) is True
+    assert cpu_manager.lookup(to_key(0)) is False
 
     # prepare load [2, 3]
     prepare_load_output = cpu_manager.prepare_load(to_keys([2, 3]))
@@ -235,8 +248,8 @@ def test_cpu_manager():
     cpu_manager.complete_store(to_keys([7, 9]), success=False)
 
     # assert [7] is still stored, but [9] is not
-    assert cpu_manager.lookup(to_keys([7])) == 1
-    assert cpu_manager.lookup(to_keys([9])) == 0
+    assert cpu_manager.lookup(to_key(7)) is True
+    assert cpu_manager.lookup(to_key(9)) is False
 
     verify_events(
         cpu_manager.take_events(),
@@ -270,7 +283,8 @@ def test_arc_manager_basic():
     )
 
     # lookup [1, 2] -> not ready
-    assert arc_manager.lookup(to_keys([1, 2])) == 0
+    assert arc_manager.lookup(to_key(1)) is False
+    assert arc_manager.lookup(to_key(2)) is False
 
     # no events so far
     assert list(arc_manager.take_events()) == []
@@ -282,9 +296,9 @@ def test_arc_manager_basic():
     )
 
     # lookup [1, 2]
-    assert arc_manager.lookup(to_keys([1])) == 1
-    assert arc_manager.lookup(to_keys([1, 2])) == 2
-    assert arc_manager.lookup(to_keys([1, 2, 3])) == 2
+    assert arc_manager.lookup(to_key(1)) is True
+    assert arc_manager.lookup(to_key(2)) is True
+    assert arc_manager.lookup(to_key(3)) is False
 
     # blocks should be in T1 (recent)
     assert len(arc_policy.t1) == 2
@@ -308,15 +322,15 @@ def test_arc_manager_t1_to_t2_promotion():
     arc_manager.complete_store(to_keys([1]))
 
     # block 1 starts in T1 (recent)
-    assert to_keys([1])[0] in arc_policy.t1
-    assert to_keys([1])[0] not in arc_policy.t2
+    assert to_key(1) in arc_policy.t1
+    assert to_key(1) not in arc_policy.t2
 
     # touch block 1 (simulate second access)
     arc_manager.touch(to_keys([1]))
 
     # block 1 should now be in T2 (frequent)
-    assert to_keys([1])[0] not in arc_policy.t1
-    assert to_keys([1])[0] in arc_policy.t2
+    assert to_key(1) not in arc_policy.t1
+    assert to_key(1) in arc_policy.t2
 
 
 def test_arc_manager_eviction_with_load():
@@ -384,7 +398,7 @@ def test_arc_manager_adaptive_target():
     arc_manager.complete_store(to_keys([3]))
 
     # block 1 should be in B1 (ghost list)
-    assert to_keys([1])[0] in arc_policy.b1
+    assert to_key(1) in arc_policy.b1
 
     # touch block 1 (cache miss, but in B1)
     # this should increase target_t1_size (favor recency)
@@ -429,9 +443,9 @@ def test_arc_manager_t1_t2_eviction_policy():
     arc_manager.complete_store(to_keys([5]))
 
     # block 1 should be in B1 (ghost list)
-    assert to_keys([1])[0] in arc_policy.b1
+    assert to_key(1) in arc_policy.b1
     # block 5 should be in T1
-    assert to_keys([5])[0] in arc_policy.t1
+    assert to_key(5) in arc_policy.t1
 
 
 def test_arc_manager_ghost_list_bounds():
@@ -524,10 +538,10 @@ def test_arc_manager_failed_store():
     arc_manager.complete_store(to_keys([5]), success=False)
 
     # block 5 should not be in cache
-    assert arc_manager.lookup(to_keys([5])) == 0
+    assert arc_manager.lookup(to_key(5)) is False
     # block 5 should not be in T1 or T2
-    assert to_keys([5])[0] not in arc_policy.t1
-    assert to_keys([5])[0] not in arc_policy.t2
+    assert to_key(5) not in arc_policy.t1
+    assert to_key(5) not in arc_policy.t2
 
     # evicted block should still be gone (in B1 ghost list)
     evicted_key = prepare_store_output.evicted_keys[0]
@@ -569,8 +583,8 @@ def test_arc_manager_full_scenario():
     arc_manager.complete_store(to_keys([6]))
 
     # verify blocks 2, 3 (in T2) are still present
-    assert arc_manager.lookup(to_keys([2])) == 1
-    assert arc_manager.lookup(to_keys([3])) == 1
+    assert arc_manager.lookup(to_key(2)) is True
+    assert arc_manager.lookup(to_key(3)) is True
 
     # verify events
     events = list(arc_manager.take_events())
@@ -593,7 +607,8 @@ def test_filter_reused_manager():
     )
 
     # Lookup [1, 2] -> 1st time, added to tracker but not eligible for store yet
-    assert manager.lookup(to_keys([1, 2])) == 0
+    assert manager.lookup(to_key(1)) is False
+    assert manager.lookup(to_key(2)) is False
 
     # prepare store [1, 2] -> should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]))
@@ -601,7 +616,7 @@ def test_filter_reused_manager():
     assert prepare_store_output.keys_to_store == []
 
     # Lookup [1] -> 2nd time, eligible now
-    assert manager.lookup(to_keys([1])) == 0
+    assert manager.lookup(to_key(1)) is False
 
     # prepare store [1, 2] -> [1] should be eligible, [2] should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]))
@@ -610,14 +625,15 @@ def test_filter_reused_manager():
 
     # Lookup [3, 4] -> 1st time
     # (evicts [2] from tracker since max_size is 3 and tracker has [1])
-    assert manager.lookup(to_keys([3, 4])) == 0
+    assert manager.lookup(to_key(3)) is False
+    assert manager.lookup(to_key(4)) is False
     # Verify [2] was evicted from the tracker (tracker now has: [1], [3], [4])
-    assert to_keys([2])[0] not in manager.counts
+    assert to_key(2) not in manager.counts
 
     # Lookup [2] again -> (this adds [2] back to the tracker as 1st time)
-    assert manager.lookup(to_keys([2])) == 0
+    assert manager.lookup(to_key(2)) is False
     # Verify [2] was re-added with count=1 (not eligible yet)
-    assert manager.counts.get(to_keys([2])[0]) == 1
+    assert manager.counts.get(to_key(2)) == 1
 
     # prepare store [2] -> should still be filtered out since count was reset
     prepare_store_output = manager.prepare_store(to_keys([2]))
