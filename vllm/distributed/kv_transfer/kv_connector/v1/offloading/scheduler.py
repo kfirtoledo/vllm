@@ -110,6 +110,13 @@ class OffloadingConnectorScheduler:
         RequestOffloadState.init_class(spec)
         self.manager: OffloadingManager = spec.get_manager()
 
+        attention_groups: list[int] = []
+        for idx, _ in enumerate(spec.kv_cache_config.kv_cache_groups):
+            # currently treat all groups as full attention
+            attention_groups.append(idx)
+
+        self.lookup_groups = attention_groups
+
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
@@ -152,62 +159,84 @@ class OffloadingConnectorScheduler:
             self._req_status[request.request_id] = req_status
         else:
             # make sure block IDs are cleared
-            for group_state in req_status.group_states:
-                group_state.block_ids.clear()
+            for gs in req_status.group_states:
+                gs.block_ids.clear()
         assert req_status is not None
         req_status.num_locally_computed_tokens = num_computed_tokens
 
-        assert len(RequestOffloadState.KV_GROUP_CONFIGS) == 1
-        assert len(req_status.group_states) == 1
-        group_config = RequestOffloadState.KV_GROUP_CONFIGS[0]
-        group_state = req_status.group_states[0]
+        for gs in req_status.group_states:
+            self.manager.touch(gs.offload_keys)
 
-        num_blocks = request.num_tokens // group_config.offloaded_block_size
+        max_hit_size_tokens: int = req_status.req.num_tokens
+        num_hit_tokens: int = 0
+        defer_lookup = False
+        delay_request = False
+        for group_idx in self.lookup_groups:
+            group_config: GroupOffloadSpec = RequestOffloadState.KV_GROUP_CONFIGS[
+                group_idx
+            ]
+            group_state: RequestGroupState = req_status.group_states[group_idx]
+            offloaded_block_size = group_config.offloaded_block_size
+            offload_keys = group_state.offload_keys
 
-        assert (
-            len(request.block_hashes) // RequestOffloadState.BLOCK_SIZE_FACTOR
-            == num_blocks
-        )
-        offload_keys = group_state.offload_keys
+            num_blocks = max_hit_size_tokens // offloaded_block_size
+            assert len(offload_keys) >= num_blocks
 
-        self.manager.touch(offload_keys)
+            max_hit_size_tokens = num_blocks * offloaded_block_size
+            num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+            if num_hit_tokens < offloaded_block_size:
+                # we can only load less than a block, better skip
+                return 0, False
 
-        full_block_tokens = group_config.offloaded_block_size * num_blocks
-        if full_block_tokens - num_computed_tokens < group_config.offloaded_block_size:
-            # we can load less than a block, skip
-            return 0, False
+            start_block_idx = num_computed_tokens // offloaded_block_size
+            offload_keys = offload_keys[start_block_idx:num_blocks]
+            block_hits = self.manager.lookup(offload_keys)
+            if block_hits == 0:
+                return 0, False
 
-        start_block_idx = num_computed_tokens // group_config.offloaded_block_size
-        hits = self.manager.lookup(offload_keys[start_block_idx:])
-        if hits is None:
-            # indicates a lookup that should be tried later
+            if block_hits is None:
+                defer_lookup = True
+            else:
+                max_hit_size_tokens = offloaded_block_size * (
+                    start_block_idx + block_hits
+                )
+
+            num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+            if num_hit_tokens < offloaded_block_size:
+                # we can only load less than a block, better skip
+                return 0, False
+
+            if (
+                block_hits
+                and self._blocks_being_loaded
+                and any(
+                    key in self._blocks_being_loaded
+                    for key in offload_keys[:block_hits]
+                )
+            ):
+                # hit blocks are being loaded, delay request
+                delay_request = True
+
+        if defer_lookup:
+            logger.debug(
+                "Offloading manager delayed request %s",
+                req_status.req.request_id,
+            )
             return None, False
-        if hits == 0:
-            return 0, False
 
-        num_hit_tokens = (
-            group_config.offloaded_block_size * (start_block_idx + hits)
-            - num_computed_tokens
-        )
+        if delay_request:
+            logger.debug(
+                "Delaying request %s since some of its blocks are already being loaded",
+                req_status.req.request_id,
+            )
+            return None, False
+
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             request.request_id,
             num_hit_tokens,
             num_computed_tokens,
         )
-        if num_hit_tokens < group_config.offloaded_block_size:
-            return 0, False
-
-        if self._blocks_being_loaded and any(
-            key in self._blocks_being_loaded
-            for key in offload_keys[start_block_idx : start_block_idx + hits]
-        ):
-            # hit blocks are being loaded, delay request
-            logger.debug(
-                "Delaying request %s since some of its blocks are already being loaded",
-                request.request_id,
-            )
-            return None, False
 
         return num_hit_tokens, True
 
