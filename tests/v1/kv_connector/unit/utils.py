@@ -102,6 +102,7 @@ def create_vllm_config(
     kv_load_failure_policy: Literal["recompute", "fail"] = "fail",
     kv_connector: str = "NixlConnector",
     kv_role: str = "kv_both",
+    disable_hybrid_kv_cache_manager: bool | None = None,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
     model_config = ModelConfig(
@@ -117,6 +118,7 @@ def create_vllm_config(
         max_model_len=max_model_len,
         enable_chunked_prefill=enable_chunked_prefill,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        disable_hybrid_kv_cache_manager=disable_hybrid_kv_cache_manager,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
