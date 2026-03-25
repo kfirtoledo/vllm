@@ -127,12 +127,8 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
         return [BlockHash(str(i).encode()) for i in int_hashes]
 
     def take_events() -> Iterable[OffloadingEvent]:
-        yield OffloadingEvent(
-            keys=to_keys([1, 2, 3]), block_size=16, medium="A", removed=False
-        )
-        yield OffloadingEvent(
-            keys=to_keys([4, 5, 6]), block_size=32, medium="B", removed=True
-        )
+        yield OffloadingEvent(keys=to_keys([1, 2, 3]), medium="A", removed=False)
+        yield OffloadingEvent(keys=to_keys([4, 5, 6]), medium="B", removed=True)
 
     runner.manager.take_events.side_effect = take_events
     events = list(runner.scheduler_connector.take_events())
@@ -140,7 +136,6 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     event = events[0]
     assert isinstance(event, BlockStored)
     assert event.block_hashes == to_hashes([1, 2, 3])
-    assert event.block_size == 16
     assert event.medium == "A"
     assert event.token_ids == []
     assert event.parent_block_hash is None
