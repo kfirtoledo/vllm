@@ -48,9 +48,9 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     # add block missing 1 token -> no offload
     runner.run(
         decoded_tokens=[0] * (offloaded_block_size - 1),
-        expected_stored_gpu_block_indexes=(3, 4, 5),
+        expected_stored=(3, 4, 5),
     )
-    runner.manager.prepare_store.assert_not_called()
+    runner.manager.touch.assert_not_called()
 
     # +1 token -> single block, fail prepare_store
     runner.manager.prepare_store.side_effect = lambda keys: None
@@ -67,7 +67,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[0] * (offloaded_block_size + 1),
-        expected_stored_gpu_block_indexes=(15, 16, 17),
+        expected_stored=(15, 16, 17),
     )
     runner.manager.touch.assert_called()
     block_hashes1 = list(runner.manager.touch.call_args.args[0])
@@ -90,7 +90,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     # terminate request
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=tuple(range(6 * block_size_factor)),
+        expected_stored=tuple(range(6 * block_size_factor)),
     )
 
     # full_block_tokens - num_computed_tokens < offloaded_block_size
@@ -112,9 +112,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.new_request(token_ids=[0] * offloaded_block_size)
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.connector_scheduler._maximal_prefix_lookup = lambda key: 1
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID], expected_loaded_gpu_block_indexes=(0, 1, 2)
-    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
 
     # single block lookup with a hit in a middle block
     runner.new_request(
@@ -122,9 +120,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     )
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.connector_scheduler._maximal_prefix_lookup = lambda key: 1
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID], expected_loaded_gpu_block_indexes=(3, 4, 5)
-    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(3, 4, 5))
 
     # test take_events
     def to_hashes(int_hashes: list[int]) -> list[BlockHash]:
@@ -195,8 +191,8 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
-        expected_flushed_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
-        expected_stored_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_flushed=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_stored=(0, 1, 2, 3, 4, 5, 6, 7, 8),
     )
 
     # restore KV cache space and reset GPU prefix cache
@@ -209,12 +205,12 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[0] * gpu_block_size,
-        expected_loaded_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
     )
 
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(9, 10, 11),
+        expected_stored=(9, 10, 11),
     )
 
 
@@ -236,7 +232,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(0, 1, 2),
+        expected_stored=(0, 1, 2),
     )
 
     # start a request to load the first block, but don't complete
@@ -267,7 +263,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_loaded_gpu_block_indexes=(0, 1, 2),
+        expected_loaded=(0, 1, 2),
     )
 
     # second request will use the GPU prefix cache
@@ -292,7 +288,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(0, 1, 2),
+        expected_stored=(0, 1, 2),
     )
 
     # start a request to load the first block, but don't complete
@@ -318,7 +314,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     # complete loading request
     runner.run(
         decoded_tokens=[],
-        expected_loaded_gpu_block_indexes=(0, 1, 2),
+        expected_loaded=(0, 1, 2),
     )
 
     # assert request is deleted
