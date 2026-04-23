@@ -315,7 +315,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # from the live GPU KV cache, which the compute stream keeps
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
-        src_access_order_any = not self.gpu_to_cpu
+        is_src_access_order_any = not self.gpu_to_cpu
         with torch.cuda.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
@@ -323,7 +323,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     batch_src,
                     batch_dst,
                     batch_sizes,
-                    src_access_order_any=src_access_order_any,
+                    is_src_access_order_any=is_src_access_order_any,
                 )
             end_event.record(stream)
 
