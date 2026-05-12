@@ -9,6 +9,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.triton_utils import triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_offload.base import (
@@ -18,6 +19,12 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.triton_swap import (
+    _MIN_N,
+    _NUM_SMS,
+    _THRESHOLD_BYTES,
+    _swap_blocks_kernel,
+)
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
@@ -25,6 +32,46 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+
+def _select_swap_blocks_fn(
+    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
+    gpu_to_cpu: bool,
+):
+    """Resolve the swap_blocks function for a handler at init time."""
+    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
+    if gpu_to_cpu:
+        return ops.swap_blocks_batch
+    page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
+    # Triton wins only on small, 8-byte-aligned payloads.
+    if (
+        not page_sizes
+        or max(page_sizes) >= _THRESHOLD_BYTES
+        or any(s % 8 for s in page_sizes)
+    ):
+        return ops.swap_blocks_batch
+    chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
+
+    def _swap(src_addrs, dst_addrs, sizes, is_src_access_order_any=False):
+        n = src_addrs.numel()
+        # Too few descriptors to amortize Triton's launch cost.
+        if n < _MIN_N:
+            ops.swap_blocks_batch(
+                src_addrs,
+                dst_addrs,
+                sizes,
+                is_src_access_order_any=is_src_access_order_any,
+            )
+            return
+        _swap_blocks_kernel[(min(_NUM_SMS, n),)](
+            src_addrs.to("cuda", non_blocking=True),
+            dst_addrs.to("cuda", non_blocking=True),
+            sizes.to("cuda", non_blocking=True),
+            n,
+            BYTES_PER_CHUNK=chunk,
+        )
+
+    return _swap
 
 
 @dataclass
@@ -160,6 +207,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
+        self._swap_blocks_batch = _select_swap_blocks_fn(
+            kv_cache_groups_data_refs, gpu_to_cpu
+        )
 
         # GPU blocks may be smaller
         # cpu_page_size = gpu_page_size * block_size_factor.
@@ -323,7 +373,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         with torch.cuda.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
-                ops.swap_blocks_batch(
+                self._swap_blocks_batch(
                     batch_src,
                     batch_dst,
                     batch_sizes,
