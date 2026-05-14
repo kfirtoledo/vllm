@@ -12,7 +12,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    WorkerConnectorInitializationData,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
@@ -65,6 +68,16 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_scheduler = OffloadingConnectorScheduler(spec)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec)
+
+    def initialize_worker_connector(
+        self,
+        initialization_data: WorkerConnectorInitializationData,
+    ) -> None:
+        if initialization_data.canonical_kv_caches is not None:
+            assert self.connector_worker is not None
+            self.connector_worker._register_handlers(
+                initialization_data.canonical_kv_caches
+            )
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
