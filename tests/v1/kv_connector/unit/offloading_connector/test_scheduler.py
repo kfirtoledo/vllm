@@ -919,3 +919,188 @@ def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
     # Finish: no store pending -> no further call.
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
     assert runner.manager.complete_store.call_count == 0
+
+
+def test_flush_all_jobs_when_no_requests_remain(request_runner):
+    """When all tracked requests are finished, build_connector_meta flushes
+    all pending jobs since there will be no future step to complete them."""
+    block_size = 4
+    block_size_factor = 1
+    offloaded_block_size = block_size * block_size_factor
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        block_size_factor=block_size_factor,
+    )
+
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        complete_transfers=False,
+        expected_stored=(0,),
+        expected_flushed=(0,),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_reset_cache(request_runner, async_scheduling: bool):
+    """reset_cache flushes in-flight loads, calls manager.reset_cache(), resets
+    next_stored_block_idx for active requests and clears job tracking."""
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # Store 1 offloaded block (3 GPU blocks) to CPU.
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2) if not async_scheduling else (),
+    )
+
+    # Reset GPU prefix cache then start a request that loads from CPU.
+    # Leave the load in-flight so that reset_cache must flush it.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[], complete_transfers=False)
+
+    # Capture in-flight load job IDs before reset.
+    load_job_ids = {
+        jid
+        for jid, status in runner.connector_scheduler._jobs.items()
+        if not status.is_store
+    }
+    assert load_job_ids, "expected in-flight load jobs before reset"
+
+    # Record job counter to verify the reset counter is set correctly.
+    job_counter_before_reset = runner.connector_scheduler._job_counter
+
+    # After update_state_after_alloc, next_stored_block_idx is advanced to
+    # skip the loaded prefix; reset_cache must bring it back to 0.
+    for req_status in runner.connector_scheduler._req_status.values():
+        for group_state in req_status.group_states:
+            assert group_state.next_stored_block_idx > 0
+
+    # Reset the cache
+    runner.connector_scheduler.reset_cache()
+
+    # manager.reset_cache() must be called exactly once.
+    runner.manager.reset_cache.assert_called_once()
+
+    # In-flight load jobs must be queued for flushing to prevent CUDA stream
+    # races between old loads and new post-reset stores.
+    assert load_job_ids <= runner.connector_scheduler._current_batch_jobs_to_flush
+
+    # All internal job tracking must be cleared.
+    assert not runner.connector_scheduler._jobs
+    assert not runner.connector_scheduler._block_id_to_pending_jobs
+    if runner.connector_scheduler._blocks_being_loaded is not None:
+        assert not runner.connector_scheduler._blocks_being_loaded
+
+    # Job reset counter must equal the job counter so that completions for
+    # pre-reset jobs arriving from workers are silently discarded.
+    assert runner.connector_scheduler._stale_job_threshold == job_counter_before_reset
+
+    # next_stored_block_idx must be reset to 0 for every active request so
+    # that post-reset stores restart from block 0.
+    for req_status in runner.connector_scheduler._req_status.values():
+        for group_state in req_status.group_states:
+            assert group_state.next_stored_block_idx == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_stale_sliding_window_block_after_prepare_store_failure(
+    request_runner, async_scheduling: bool
+):
+    """Regression test: when prepare_store fails (returns None), offloading is
+    delayed. Meanwhile, sliding window blocks get freed and reallocated to the
+    same request. On retry, the stale block_id must be detected and skipped.
+
+    Without the fix, the stale block_id would either:
+    - Cause a KeyError in _remove_pending_job (duplicate in
+      _block_id_to_pending_jobs)
+    - Silently offload wrong data under a wrong key
+    """
+    block_size = 4
+    # sliding_window = 8 -> window of 2 blocks
+    sliding_window = 8
+    # Use a tight GPU block budget so freed sliding window blocks are
+    # immediately reused by the same request's new allocations.
+    num_gpu_blocks = 4
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Request with 3 blocks of prompt. Window = 2 blocks, so block 0 is
+    # outside the window but won't be freed until the next allocate_slots.
+    runner.new_request(token_ids=[0] * block_size * 3)
+
+    # First step: prepare_store FAILS -> offloading delayed.
+    # next_stored_block_idx stays at 0, block_ids[0] still holds the
+    # original block_id for position 0.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: None
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.assert_called()
+
+    # Second step: decode more tokens -> block 3 allocated.
+    # allocate_slots calls remove_skipped_blocks which frees block 0
+    # (it's now outside the sliding window). With num_gpu_blocks=4,
+    # the freed block is immediately reused for the new allocation.
+    # prepare_store still fails so offloading is still delayed.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: None
+    runner.run(decoded_tokens=[0] * block_size)
+
+    # Now prepare_store succeeds.
+    # Without the fix, the request would try to offload the stale block_id
+    # at position 0 (now reused at position 3), causing a duplicate in
+    # sliding_window_block_ids and eventually a KeyError.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    # block_ids=[0, 2, 3, 1]: position 0 zeroed (stale), positions 1-3 valid.
+    # With async_scheduling, fewer tokens are "computed" by the time offloading
+    # runs, so only 3 offloaded blocks are eligible (indices 0-2). After
+    # zeroing index 0, blocks at indices 1,2 are stored (request offsets 2,3).
+    # Without async_scheduling, all 4 blocks are eligible, so indices 1,2,3
+    # are stored (request offsets 1,2,3).
+    if async_scheduling:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(2, 3))
+    else:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(1, 2, 3))
