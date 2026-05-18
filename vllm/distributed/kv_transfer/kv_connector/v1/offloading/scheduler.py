@@ -235,11 +235,17 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+        # Idempotent walk: with HMA, a physical block can back both a full
+        # and a sliding-window group, so the same bid may legitimately
+        # appear in both of a job's tracking lists; the first cleanup
+        # deletes the dict entry and the second must not crash.
         for bid in block_ids or ():
-            pending = self._block_id_to_pending_jobs[bid]
-            pending.remove(job_id)
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                continue
+            pending.discard(job_id)
             if not pending:
-                del self._block_id_to_pending_jobs[bid]
+                self._block_id_to_pending_jobs.pop(bid, None)
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -732,9 +738,20 @@ class OffloadingConnectorScheduler:
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
 
+            # Dedupe tracking lists and enforce disjointness. With HMA, one
+            # physical block can back both a full-attention group and a
+            # sliding-window group of the same request, so the same bid can
+            # land in both lists; the sliding-window cleanup at store
+            # completion already covers it, so drop it from the non-sliding
+            # list to avoid a double-clean KeyError when the request also
+            # finishes. set() additionally dedupes within each list in the
+            # unlikely case two same-kind groups share a physical block.
+            sliding_set = set(sliding_window_block_ids)
+            non_sliding_set = set(non_sliding_window_block_ids) - sliding_set
+
             # Watch sliding window blocks as they may get evicted
             # before the request finishes
-            for bid in sliding_window_block_ids or ():
+            for bid in sliding_set:
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
 
             # the non-sliding window blocks will be watched only
@@ -744,8 +761,8 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(keys_to_store),
                 is_store=True,
-                non_sliding_window_block_ids=non_sliding_window_block_ids,
-                sliding_window_block_ids=sliding_window_block_ids or None,
+                non_sliding_window_block_ids=list(non_sliding_set) or None,
+                sliding_window_block_ids=list(sliding_set) or None,
             )
 
             store_jobs[job_id] = TransferJob(
