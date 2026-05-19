@@ -193,34 +193,54 @@ class OffloadingConnectorWorker:
         for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
             tensor_layer_names = kv_cache_tensor.shared_by
 
-            # verify all layers in the group reference the exact same tensors
-            assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
-
-            # pick the first layer to represent the group
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
-                    )
-                )
-
-                curr_tensor_idx = len(block_tensors) - 1
-                for layer_name in tensor_layer_names:
-                    block_data_refs[layer_name].append(
-                        CanonicalKVCacheRef(
-                            tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+            # PATCH (V4 hybrid): support layers with heterogeneous tensor
+            # layouts inside the same shared_by group. V4's
+            # _get_kv_cache_config_deepseek_v4 builds a single KVCacheTensor
+            # whose shared_by lists one layer per group (MLA, SWA-C4,
+            # SWA-C128); those layers view the same physical memory through
+            # potentially different attn-backend shapes (1-tuple vs 2-tuple,
+            # different stride). For each unique tensor-layout signature
+            # inside shared_by, register one canonical tensor; layers map to
+            # the canonical entry of their own layout.
+            layer_sigs = {
+                n: (len(tensors_per_block[n]), tensors_per_block[n][0].stride())
+                for n in tensor_layer_names
+            }
+            if len(set(layer_sigs.values())) == 1:
+                # Homogeneous: same behaviour as the original.
+                first_layer_name = tensor_layer_names[0]
+                for tensor in tensors_per_block[first_layer_name]:
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[first_layer_name],
                         )
                     )
+                    curr_tensor_idx = len(block_tensors) - 1
+                    for layer_name in tensor_layer_names:
+                        block_data_refs[layer_name].append(
+                            CanonicalKVCacheRef(
+                                tensor_idx=curr_tensor_idx,
+                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            )
+                        )
+            else:
+                # Heterogeneous (V4): each layer gets its own canonical view.
+                for layer_name in tensor_layer_names:
+                    for tensor in tensors_per_block[layer_name]:
+                        block_tensors.append(
+                            CanonicalKVCacheTensor(
+                                tensor=tensor,
+                                page_size_bytes=page_size_bytes[layer_name],
+                            )
+                        )
+                        curr_tensor_idx = len(block_tensors) - 1
+                        block_data_refs[layer_name].append(
+                            CanonicalKVCacheRef(
+                                tensor_idx=curr_tensor_idx,
+                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            )
+                        )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
         for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
