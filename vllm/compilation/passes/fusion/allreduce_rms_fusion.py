@@ -195,7 +195,8 @@ if flashinfer_comm is not None:
             input=allreduce_in,
             workspace=workspace,
             pattern=pattern_code,
-            launch_with_pdl=launch_with_pdl,
+            launch_with_pdl=launch_with_pdl
+            and (num_tokens > PDL_ADVANCE_LAUNCH_TOKENS),
             output=None,
             residual_out=residual_out,
             norm_out=norm_out,
@@ -208,7 +209,6 @@ if flashinfer_comm is not None:
             layout_code=layout_code,
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
-            trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
 
     def call_trtllm_fused_allreduce_norm_fake(
