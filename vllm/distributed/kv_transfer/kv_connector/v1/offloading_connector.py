@@ -81,6 +81,22 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
+    def initialize_worker_connector(
+        self,
+        initialization_data: "WorkerConnectorInitializationData",
+    ) -> None:
+        # On the canonical-KV-caches path (PR #37885), gpu_model_runner skips
+        # register_kv_caches() / register_cross_layers_kv_cache() and instead
+        # routes through here. Register transfer handlers from the canonical
+        # caches so transfer_async can find them.
+        if self.connector_worker is None:
+            return
+        if initialization_data.canonical_kv_caches is None:
+            return
+        self.connector_worker._register_handlers(
+            initialization_data.canonical_kv_caches
+        )
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None
         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)

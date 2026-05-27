@@ -7069,6 +7069,7 @@ class GPUModelRunner(
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
         if self.use_canonical_kv_caches(kv_cache_config, self.attn_groups, cache_dtype):
+            logger.info("[canonical_kv_caches] activated (PR #37885 path)")
             kv_caches, self.canonical_kv_caches = self.allocate_canonical_kv_caches(
                 kv_cache_config,
                 self.attn_groups,
