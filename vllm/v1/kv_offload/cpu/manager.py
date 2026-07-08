@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 
@@ -25,6 +26,12 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+
+_ALWAYS_FROM_STORAGE = os.environ.get("TIERING_ALWAYS_FROM_STORAGE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -159,8 +166,13 @@ class CPUOffloadingManager(OffloadingManager):
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
-                self._policy.mark_evictable(key)
+                if _ALWAYS_FROM_STORAGE:
+                    # Skip the evictable state entirely — remove immediately
+                    self._policy.remove(key)
+                    self._free_block(block)
+                else:
+                    self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
+                    self._policy.mark_evictable(key)
 
     @override
     def prepare_store(
